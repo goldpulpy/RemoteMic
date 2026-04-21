@@ -63,7 +63,7 @@ flowchart LR
 ### From Prebuilt Binary
 
 ```bash
-curl -L https://github.com/goldpulpy/RemoteMic/releases/latest/download/remotemic -o remotemic
+curl -L https://github.com/goldpulpy/RemoteMic/releases/download/latest/remotemic -o remotemic
 chmod +x remotemic
 sudo mv remotemic /usr/local/bin/remotemic
 ```
@@ -71,7 +71,7 @@ sudo mv remotemic /usr/local/bin/remotemic
 > Alternatively, if you prefer `wget`:
 
 ```bash
-wget https://github.com/goldpulpy/RemoteMic/releases/latest/download/remotemic
+wget https://github.com/goldpulpy/RemoteMic/releases/download/latest/remotemic
 chmod +x remotemic
 sudo mv remotemic /usr/local/bin/remotemic
 ```
