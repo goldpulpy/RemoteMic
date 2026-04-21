@@ -1,0 +1,49 @@
+name: Release Build
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build and Upload Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools make
+
+      - name: Build release binary
+        run: make release
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/remotemic dist/remotemic
+          chmod +x dist/remotemic
+
+      - name: Create or update "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest build (main)"
+          prerelease: true
+          files: dist/remotemic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
