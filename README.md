@@ -1,10 +1,10 @@
 # RemoteMic
 
-Use your phone (or any browser device) as a high-quality wireless microphone for your Linux PC.
+Use a device with a higher-quality microphone as a virtual microphone on your Linux PC.
 
 ## Why
 
-Laptop microphones are often low quality. RemoteMic lets you use your phone’s microphone as a virtual system input on your Linux machine over WiFi—no cables required.
+Laptop microphones are often low quality. RemoteMic lets you use your phone’s microphone as a virtual system input on your Linux machine over WiFi-no cables required.
 
 ---
 

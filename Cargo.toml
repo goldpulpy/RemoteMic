@@ -2,6 +2,10 @@
 name = "remotemic"
 version = "1.0.0"
 edition = "2024"
+authors = ["goldpulpy"]
+description = "Remote microphone streaming server using Axum + WebSockets"
+license = "MIT"
+repository = "https://github.com/goldpulpy/remotemic"
 
 [profile.release]
 opt-level = 3
