@@ -42,7 +42,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: "Latest build (main)"
+          name: "Linux x86_64"
           prerelease: true
           files: dist/remotemic
         env:
