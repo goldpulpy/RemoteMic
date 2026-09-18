@@ -30,6 +30,7 @@ use rtc::{
 use serde::Serialize;
 use std::{
     collections::VecDeque,
+    net::IpAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -69,6 +70,7 @@ pub struct Server {
     audio_config: AudioConfig,
     ca_der: Arc<[u8]>,
     metrics: MetricsHub,
+    ice_udp_addrs: Arc<[String]>,
 }
 
 pub struct AudioFrame {
@@ -289,7 +291,12 @@ impl MetricsHub {
 }
 
 impl Server {
-    pub fn new(audio_tx: AudioFrameSender, audio_config: AudioConfig, ca_der: Vec<u8>) -> Self {
+    pub fn new(
+        audio_tx: AudioFrameSender,
+        audio_config: AudioConfig,
+        ca_der: Vec<u8>,
+        bind: IpAddr,
+    ) -> Self {
         let token = format!(
             "{:016x}{:016x}",
             rand::random::<u64>(),
@@ -302,6 +309,7 @@ impl Server {
             audio_config,
             ca_der: Arc::from(ca_der),
             metrics: MetricsHub::default(),
+            ice_udp_addrs: Arc::from(ice_udp_addrs(bind)),
         }
     }
 
@@ -507,14 +515,15 @@ async fn handle_socket(socket: WebSocket, state: Server) {
         gather_complete: Arc::clone(&gather_complete),
         connected: Arc::clone(&connected),
     });
-    let peer = match create_peer_connection(Arc::clone(&handler)).await {
-        Ok(peer) => peer,
-        Err(error) => {
-            error!(session_id, %error, "Could not create WebRTC peer");
-            handler.release();
-            return;
-        }
-    };
+    let peer =
+        match create_peer_connection(Arc::clone(&handler), state.ice_udp_addrs.to_vec()).await {
+            Ok(peer) => peer,
+            Err(error) => {
+                error!(session_id, %error, "Could not create WebRTC peer");
+                handler.release();
+                return;
+            }
+        };
 
     let offer = tokio::time::timeout(SIGNALING_IDLE_TIMEOUT, receive_offer(&mut receiver)).await;
     let offer = match offer {
@@ -560,6 +569,7 @@ async fn handle_socket(socket: WebSocket, state: Server) {
 
 async fn create_peer_connection(
     handler: Arc<WebRtcHandler>,
+    udp_addrs: Vec<String>,
 ) -> Result<Arc<dyn PeerConnection>, String> {
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -585,7 +595,7 @@ async fn create_peer_connection(
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
         .with_handler(handler as Arc<dyn PeerConnectionEventHandler>)
-        .with_udp_addrs(vec!["0.0.0.0:0"])
+        .with_udp_addrs(udp_addrs)
         .build()
         .await
         .map_err(|error| error.to_string())?;
@@ -695,24 +705,16 @@ async fn receive_opus_track(
             .0
             .packets_received
             .fetch_add(1, Ordering::Relaxed);
-        update_jitter(
-            &handler.metrics,
-            packet.header.timestamp,
-            now,
-            &mut previous_arrival,
-            &mut previous_timestamp,
-            &mut jitter_ticks,
-        );
         if let Some(previous) = sequence {
-            let delta = packet.header.sequence_number.wrapping_sub(previous);
-            if delta == 0 || delta > 0x8000 {
+            let Some(delta) = forward_sequence_delta(previous, packet.header.sequence_number)
+            else {
                 handler
                     .metrics
                     .0
                     .packets_reordered
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
-            }
+            };
             let missing = delta.saturating_sub(1);
             handler
                 .metrics
@@ -732,6 +734,14 @@ async fn receive_opus_track(
                 }
             }
         }
+        update_jitter(
+            &handler.metrics,
+            packet.header.timestamp,
+            now,
+            &mut previous_arrival,
+            &mut previous_timestamp,
+            &mut jitter_ticks,
+        );
         sequence = Some(packet.header.sequence_number);
         if !has_opus_payload(&packet.payload) {
             trace!(
@@ -835,11 +845,25 @@ fn update_jitter(
     trace!(timestamp, jitter_ticks, "Updated RTP jitter");
 }
 
+fn forward_sequence_delta(previous: u16, current: u16) -> Option<u16> {
+    let delta = current.wrapping_sub(previous);
+    (delta != 0 && delta <= 0x8000).then_some(delta)
+}
+
+fn ice_udp_addrs(bind: IpAddr) -> Vec<String> {
+    let mut addrs = vec!["0.0.0.0:0".to_owned()];
+    if bind.is_ipv6() {
+        addrs.push("[::]:0".to_owned());
+    }
+    addrs
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AudioFrame, MetricsHub, SessionRegistry, StreamMetrics, audio_frame_channel,
-        concealment_toc, constant_time_eq, has_opus_payload, render_page,
+        concealment_toc, constant_time_eq, forward_sequence_delta, has_opus_payload, ice_udp_addrs,
+        render_page,
     };
     use crate::audio::AudioConfig;
     use std::sync::atomic::Ordering;
@@ -912,6 +936,16 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn page_registers_capture_for_cleanup_before_audio_setup() {
+        let html = render_page("test-token", AudioConfig::STANDARD);
+        let registration = html.find("session = activeSession;").unwrap();
+        let audio_setup = html.find("await audioContext.resume();").unwrap();
+
+        assert!(registration < audio_setup);
+        assert!(html.contains("activeSession.stream.getTracks().forEach((track) => track.stop())"));
+    }
+
     #[tokio::test]
     async fn full_audio_queue_replaces_oldest_frame() {
         let (sender, receiver) = audio_frame_channel(1);
@@ -933,5 +967,25 @@ mod tests {
     fn empty_rtp_payload_is_not_passed_to_opus_decoder() {
         assert!(!has_opus_payload(&[]));
         assert!(has_opus_payload(&[0xf8, 0xff, 0xfe]));
+    }
+
+    #[test]
+    fn reordered_and_duplicate_sequences_are_rejected() {
+        assert_eq!(forward_sequence_delta(100, 100), None);
+        assert_eq!(forward_sequence_delta(100, 99), None);
+        assert_eq!(forward_sequence_delta(u16::MAX, 0), Some(1));
+    }
+
+    #[test]
+    fn ipv6_listener_enables_ipv4_and_ipv6_ice_sockets() {
+        assert_eq!(
+            ice_udp_addrs("::".parse().unwrap()),
+            ["0.0.0.0:0", "[::]:0"]
+        );
+    }
+
+    #[test]
+    fn ipv4_listener_uses_only_ipv4_ice_socket() {
+        assert_eq!(ice_udp_addrs("0.0.0.0".parse().unwrap()), ["0.0.0.0:0"]);
     }
 }

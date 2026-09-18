@@ -847,7 +847,28 @@ pub const HTML: &str = r#"
           },
           video: false,
         });
+        const activeSession = {
+          stream,
+          track: null,
+          audioContext: null,
+          source: null,
+          analyser: null,
+          silentGain: null,
+          peer: null,
+          socket: null,
+          wakeLock: null,
+          metricsTimer: null,
+          answerTimer: null,
+          animationFrame: null,
+          stopping: false,
+          muted: false,
+        };
+        // Register captured media immediately so stop() can release it if any
+        // later setup step fails.
+        session = activeSession;
+
         const track = stream.getAudioTracks()[0];
+        activeSession.track = track;
         if ("contentHint" in track) track.contentHint = "music";
 
         const AudioContextClass =
@@ -859,12 +880,16 @@ pub const HTML: &str = r#"
           console.debug("Falling back to the default AudioContext rate", error);
           audioContext = new AudioContextClass();
         }
+        activeSession.audioContext = audioContext;
         await audioContext.resume();
         const source = audioContext.createMediaStreamSource(stream);
+        activeSession.source = source;
         const analyser = audioContext.createAnalyser();
+        activeSession.analyser = analyser;
         analyser.fftSize = 256;
         analyser.smoothingTimeConstant = 0.72;
         const silentGain = audioContext.createGain();
+        activeSession.silentGain = silentGain;
         silentGain.gain.value = 0;
         source.connect(analyser);
         analyser.connect(silentGain);
@@ -874,28 +899,13 @@ pub const HTML: &str = r#"
           iceServers: [],
           bundlePolicy: "max-bundle",
         });
+        activeSession.peer = peer;
         const sender = peer.addTrack(track, stream);
         preferOpus(peer);
         await tuneSender(sender);
 
         const socket = new WebSocket(websocketUrl());
-        const activeSession = {
-          stream,
-          track,
-          audioContext,
-          source,
-          analyser,
-          silentGain,
-          peer,
-          socket,
-          wakeLock: null,
-          metricsTimer: null,
-          answerTimer: null,
-          animationFrame: null,
-          stopping: false,
-          muted: false,
-        };
-        session = activeSession;
+        activeSession.socket = socket;
 
         socket.addEventListener("message", async ({ data }) => {
           if (session !== activeSession) return;
@@ -985,12 +995,12 @@ pub const HTML: &str = r#"
         clearTimeout(activeSession.answerTimer);
         cancelAnimationFrame(activeSession.animationFrame);
         activeSession.stream.getTracks().forEach((track) => track.stop());
-        activeSession.peer.close();
-        activeSession.socket.close();
-        activeSession.source.disconnect();
-        activeSession.analyser.disconnect();
-        activeSession.silentGain.disconnect();
-        await activeSession.audioContext.close().catch(() => {});
+        activeSession.peer?.close();
+        activeSession.socket?.close();
+        activeSession.source?.disconnect();
+        activeSession.analyser?.disconnect();
+        activeSession.silentGain?.disconnect();
+        await activeSession.audioContext?.close().catch(() => {});
         await activeSession.wakeLock?.release().catch(() => {});
 
         btn.disabled = false;

@@ -280,10 +280,9 @@ async fn unload_stale_modules(source_name: &str) -> usize {
             Ok(output) if output.status.success() => output,
             _ => return 0,
         };
-        let marker = format!("source_name={source_name}");
         let mut unloaded = 0;
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if !line.contains("module-pipe-source") || !line.contains(&marker) {
+            if !is_pipe_source_for(line, &source_name) {
                 continue;
             }
             let Some(index) = line.split_whitespace().next() else {
@@ -312,6 +311,13 @@ async fn unload_stale_modules(source_name: &str) -> usize {
     })
     .await
     .unwrap_or(0)
+}
+
+fn is_pipe_source_for(line: &str, source_name: &str) -> bool {
+    let marker = format!("source_name={source_name}");
+    let mut fields = line.split_whitespace();
+    let _index = fields.next();
+    fields.next() == Some("module-pipe-source") && fields.any(|field| field == marker)
 }
 
 fn default_pipe_path() -> Result<PathBuf, String> {
@@ -373,7 +379,7 @@ fn pipe_dir(uid: u32) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceLock, ensure_private_directory};
+    use super::{InstanceLock, ensure_private_directory, is_pipe_source_for};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn unique_test_path(name: &str) -> std::path::PathBuf {
@@ -443,5 +449,14 @@ mod tests {
         drop(third);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_module_match_requires_exact_source_name() {
+        let exact = "17\tmodule-pipe-source\tsource_name=RemoteMic file=/tmp/mic\t0";
+        let prefixed = "18\tmodule-pipe-source\tsource_name=RemoteMicBackup file=/tmp/backup\t0";
+
+        assert!(is_pipe_source_for(exact, "RemoteMic"));
+        assert!(!is_pipe_source_for(prefixed, "RemoteMic"));
     }
 }

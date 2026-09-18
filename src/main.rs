@@ -119,7 +119,7 @@ async fn run_service(
         "Virtual source: {} (audio queue: {} frames)",
         options.source_name, options.queue_size
     );
-    let server = Server::new(audio_tx, audio_config, local_tls.ca_der);
+    let server = Server::new(audio_tx, audio_config, local_tls.ca_der, listen_addr.ip());
 
     print_access_urls(&advertised_ips, port, &local_tls.ca_path);
 
