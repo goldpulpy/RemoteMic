@@ -7,7 +7,7 @@ pub const HTML: &str = r#"
     <title>Remote Microphone</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link
-      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap"
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Serif&display=swap"
       rel="stylesheet"
     />
     <style>
@@ -99,7 +99,6 @@ pub const HTML: &str = r#"
       }
       .wordmark h1 {
         font-family: "Instrument Serif", serif;
-        font-style: italic;
         font-size: 1.6rem;
         font-weight: 400;
         letter-spacing: -0.01em;
@@ -574,6 +573,8 @@ pub const HTML: &str = r#"
       const BYTES_PER_SAMPLE = __REMOTEMIC_BYTES_PER_SAMPLE__;
       const BUFFER_SIZE = SAMPLE_RATE <= 16000 ? 1024 : 4096;
       const MAX_BUFFERED_BYTES = BUFFER_SIZE * BYTES_PER_SAMPLE * 4;
+      const METER_FLOOR_DB = -55;
+      const METER_CEILING_DB = -12;
       const TOKEN = "__REMOTEMIC_TOKEN__";
 
       let currentSession = null;
@@ -705,8 +706,10 @@ pub const HTML: &str = r#"
         session.source = audioCtx.createMediaStreamSource(mediaStream);
 
         session.analyser = audioCtx.createAnalyser();
-        session.analyser.fftSize = 64;
-        session.analyser.smoothingTimeConstant = 0.7;
+        session.analyser.fftSize = 1024;
+        session.analyser.smoothingTimeConstant = 0.82;
+        session.analyser.minDecibels = -70;
+        session.analyser.maxDecibels = -20;
 
         session.processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
         session.processor.onaudioprocess = (ev) => {
@@ -767,6 +770,23 @@ pub const HTML: &str = r#"
 
         const timeBuf = new Uint8Array(session.analyser.frequencyBinCount);
         const freqBuf = new Uint8Array(session.analyser.frequencyBinCount);
+        const binWidth = session.audioCtx.sampleRate / session.analyser.fftSize;
+        const minFrequency = 80;
+        const maxFrequency = Math.min(8_000, session.audioCtx.sampleRate / 2);
+        const frequencyRange = maxFrequency / minFrequency;
+        const barRanges = Array.from(barSpans, (_, index) => {
+          const lowFrequency =
+            minFrequency * Math.pow(frequencyRange, index / barSpans.length);
+          const highFrequency =
+            minFrequency *
+            Math.pow(frequencyRange, (index + 1) / barSpans.length);
+          const start = Math.max(0, Math.floor(lowFrequency / binWidth));
+          const end = Math.min(
+            freqBuf.length,
+            Math.max(start + 1, Math.ceil(highFrequency / binWidth)),
+          );
+          return { start, end };
+        });
 
         function tick() {
           if (!isCurrent(session)) return;
@@ -774,13 +794,32 @@ pub const HTML: &str = r#"
           let peak = 0;
           for (let i = 0; i < timeBuf.length; i++)
             peak = Math.max(peak, Math.abs(timeBuf[i] - 128));
-          meterFill.style.width = Math.min(100, (peak / 128) * 200) + "%";
+          const peakDb = 20 * Math.log10(Math.max(peak / 128, 0.0001));
+          const targetLevel = session.muted
+            ? 0
+            : Math.max(
+                0,
+                Math.min(
+                  1,
+                  (peakDb - METER_FLOOR_DB) /
+                    (METER_CEILING_DB - METER_FLOOR_DB),
+                ),
+              );
+          const meterSmoothing =
+            targetLevel > session.meterLevel ? 0.14 : 0.045;
+          session.meterLevel +=
+            (targetLevel - session.meterLevel) * meterSmoothing;
+          meterFill.style.width = session.meterLevel * 100 + "%";
 
           session.analyser.getByteFrequencyData(freqBuf);
-          const step = Math.floor(freqBuf.length / barSpans.length);
           barSpans.forEach((bar, i) => {
-            const val = session.muted ? 0 : freqBuf[i * step] || 0;
-            bar.style.height = 4 + (val / 255) * 22 + "px";
+            const { start, end } = barRanges[i];
+            let val = 0;
+            if (!session.muted) {
+              for (let bin = start; bin < end; bin++)
+                val = Math.max(val, freqBuf[bin]);
+            }
+            bar.style.height = 4 + Math.sqrt(val / 255) * 22 + "px";
           });
 
           session.meterRaf = requestAnimationFrame(tick);
@@ -893,6 +932,7 @@ pub const HTML: &str = r#"
           processor: null,
           analyser: null,
           meterRaf: null,
+          meterLevel: 0,
           wakeLock: null,
           wakeLockRequest: null,
           closeResolvers: [],
