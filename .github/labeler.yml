@@ -1,0 +1,59 @@
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "README.md"
+          - "README.ru.md"
+          - "AGENTS.md"
+          - "LICENSE"
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Cargo.toml"
+          - "Cargo.lock"
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/**"
+          - ".github/*.yml"
+
+build:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Makefile"
+          - "Cargo.toml"
+          - "Cargo.lock"
+
+rust:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/**/*.rs"
+          - "Cargo.toml"
+
+audio:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/audio.rs"
+          - "src/preflight.rs"
+
+server:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/server.rs"
+
+web-ui:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/page.rs"
+
+tls:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tls.rs"
+
+security:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tls.rs"
+          - ".github/workflows/ci.yml"

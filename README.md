@@ -1,7 +1,21 @@
-# RemoteMic
+<div align="center">
 
-Use a phone or another browser-equipped device as a real-time virtual
-microphone on a Linux computer.
+# 🎙️ RemoteMic
+
+<p><b>Use a phone or another browser-equipped device as a real-time virtual microphone on a Linux computer</b></p>
+
+[![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Axum](https://img.shields.io/badge/Axum-0.8-2e6baf)](https://github.com/tokio-rs/axum)
+[![WebRTC](https://img.shields.io/badge/WebRTC-Opus-333333?logo=webrtc&logoColor=white)](https://webrtc.org/)
+[![PulseAudio](https://img.shields.io/badge/PulseAudio-PipeWire-6a5acd)](https://www.freedesktop.org/wiki/Software/PulseAudio/)
+[![CI](https://github.com/goldpulpy/RemoteMic/actions/workflows/ci.yml/badge.svg)](https://github.com/goldpulpy/RemoteMic/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+[English](README.md) · [Русский](README.ru.md)
+
+[🚀 Quick start](#quick-start) · [🎚 Audio quality](#audio-quality) · [🛠 Installation](#installation) · [🔒 Security](#security-model) · [❓ Troubleshooting](#troubleshooting) · [📄 License](#license)
+
+</div>
 
 RemoteMic captures audio in the browser, sends it over WebRTC using Opus, and
 exposes it through PulseAudio or PipeWire Pulse compatibility as a system input
@@ -12,7 +26,7 @@ RemoteMic serves its own HTTPS interface with a persistent, self-signed local
 certificate authority, so no external tunnel is required when both devices are
 on the same network.
 
-## Highlights
+## ✨ Highlights
 
 - Audio over WebRTC (Opus); the browser encodes, and the server decodes to PCM
 - Built-in HTTPS with a persistent local CA; no tunnel needed on a LAN
@@ -23,7 +37,7 @@ on the same network.
 - Live RTT, jitter, packet-loss, and queue metrics on the page
 - A single Rust binary with the web interface embedded in it
 
-## Audio quality
+## 🎚️ Audio quality
 
 RemoteMic has three quality presets:
 
@@ -64,7 +78,7 @@ differ from the request.
 
 </details>
 
-## How it works
+## ⚙️ How it works
 
 <details>
 <summary><strong>Show the architecture and real-time audio path</strong></summary>
@@ -116,7 +130,7 @@ RemoteMic uses `$TMPDIR/remotemic-<uid>`. The local CA is kept across reboots in
 `~/.local/share/remotemic`. Both application directories are created with mode
 `0700`, and the CA private key is written with mode `0600`.
 
-### Real-time behavior
+### ⏱️ Real-time behavior
 
 RemoteMic is designed as a live microphone, not as a lossless recorder. The
 server uses a queue of one audio frame by default. When the output cannot keep
@@ -130,12 +144,12 @@ all four values.
 
 </details>
 
-## Requirements
+## 📋 Requirements
 
 <details>
 <summary><strong>Show system and browser requirements</strong></summary>
 
-### Linux computer
+### 🐧 Linux computer
 
 - Linux
 - PulseAudio, or PipeWire with `pipewire-pulse`
@@ -143,7 +157,7 @@ all four values.
   PulseAudio client package
 - `libpulse.so.0` and `libasound.so.2`
 
-### Sending device
+### 📱 Sending device
 
 - A modern browser with `getUserMedia`, Web Audio, and WebRTC support
 - Microphone permission
@@ -154,7 +168,7 @@ No public tunnel or internet connection is required for a same-network setup.
 
 </details>
 
-## Installation
+## 📦 Installation
 
 <details open>
 <summary><strong>Install a prebuilt binary</strong></summary>
@@ -201,7 +215,7 @@ make release
 
 </details>
 
-## Command-line options
+## ⌨️ Command-line options
 
 <details>
 <summary><strong>Show the complete CLI reference and examples</strong></summary>
@@ -308,9 +322,9 @@ with `Ctrl+C`; it will unload the virtual source and remove its FIFO.
 
 </details>
 
-## Quick start
+## 🚀 Quick start
 
-### 1. Start RemoteMic
+### 1️⃣ Start RemoteMic
 
 ```bash
 remotemic --quality high
@@ -320,7 +334,7 @@ For speech over a slower network, use `--quality low`. On startup RemoteMic
 prints an HTTPS URL such as `https://192.168.1.10:59152` and the path to
 `remotemic-ca.crt`.
 
-### 2. Trust the local certificate
+### 2️⃣ Trust the local certificate
 
 The page is served over HTTPS with a certificate signed by RemoteMic's local CA.
 The sending device must trust that CA, otherwise the browser may block
@@ -371,7 +385,7 @@ the same RemoteMic address should open without the certificate warning.
 > if you control the machine running RemoteMic and trust it. The CA private key
 > stays on the computer and is never served.
 
-### 3. Connect the phone
+### 3️⃣ Connect the phone
 
 1. Open the printed HTTPS URL.
 2. Press **Connect microphone**.
@@ -383,7 +397,7 @@ browser tracks, closes the WebRTC connection and signaling WebSocket, and allows
 another device to connect. **Mute** temporarily silences the current stream
 without ending the session.
 
-### 4. Select the virtual microphone
+### 4️⃣ Select the virtual microphone
 
 In the Linux sound settings or the recording application, select
 **RemoteMic** as the input device.
@@ -400,9 +414,9 @@ Inspect its negotiated details:
 pactl list sources
 ```
 
-## Uninstallation
+## 🗑️ Uninstallation
 
-### Remove the certificate from sending devices
+### 🔐 Remove the certificate from sending devices
 
 The certificate is listed as **RemoteMic Local CA** in the device's trusted
 certificate store. Remove it from every device on which it was installed:
@@ -413,8 +427,8 @@ certificate store. Remove it from every device on which it was installed:
 Open **Settings → Security & privacy → More security settings → Encryption &
 credentials → Trusted credentials**, select the **User** tab, open
 **RemoteMic Local CA**, and remove or disable it. Menu names vary by Android
-version and device manufacturer; searching Settings for “credentials” or
-“certificates” usually opens the correct screen.
+version and device manufacturer; searching Settings for "credentials" or
+"certificates" usually opens the correct screen.
 
 </details>
 
@@ -437,7 +451,7 @@ certificate-authority entries, then fully restart the browser.
 
 </details>
 
-### Uninstall RemoteMic from Linux
+### 🧹 Uninstall RemoteMic from Linux
 
 Stop RemoteMic with `Ctrl+C`, then remove the prebuilt binary installed by the
 commands in this README:
@@ -461,7 +475,7 @@ remove the cloned repository or whichever binary you copied manually.
 > key. If RemoteMic is run again, it will generate a new CA that must be
 > installed on every sending device again.
 
-## Choosing a quality mode
+## 🎛️ Choosing a quality mode
 
 <details>
 <summary><strong>When to use low, standard, or high</strong></summary>
@@ -499,7 +513,7 @@ network packet loss.
 
 </details>
 
-## Security model
+## 🔒 Security model
 
 <details>
 <summary><strong>What is protected and what becomes public</strong></summary>
@@ -523,7 +537,7 @@ does not store recordings or intentionally write captured audio to disk.
 
 </details>
 
-## Troubleshooting
+## ❓ Troubleshooting
 
 <details>
 <summary><strong><code>pactl</code> is not installed</strong></summary>
@@ -655,7 +669,7 @@ RemoteMic and use `--quality standard` as a compatibility fallback.
 
 </details>
 
-## Current limitations
+## ⚠️ Current limitations
 
 <details>
 <summary><strong>Show current limitations</strong></summary>
@@ -672,7 +686,7 @@ RemoteMic and use `--quality standard` as a compatibility fallback.
 
 </details>
 
-## Development
+## 💻 Development
 
 <details>
 <summary><strong>Show project layout and development commands</strong></summary>
@@ -703,6 +717,6 @@ Audio travels over WebRTC and is not subject to that limit.
 
 </details>
 
-## License
+## 📄 License
 
 MIT License - see [LICENSE](LICENSE).
