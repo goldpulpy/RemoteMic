@@ -25,7 +25,8 @@ NC := \033[0m # No Color
 .PHONY: release
 release:
 	RUSTFLAGS="$(RUSTFLAGS)" cargo build --release --target $(TARGET)
-	objcopy --strip-all --remove-section=.comment --remove-section=.note $(RELEASE) $(RELEASE)
+	objcopy --strip-all --remove-section=.comment --remove-section=.note $(RELEASE) $(RELEASE).stripped
+	mv $(RELEASE).stripped $(RELEASE)
 	@echo "${GREEN}Built: $(RELEASE)${NC}"
 
 .PHONY: security
@@ -70,4 +71,3 @@ help:
 	@echo "  APP=$(APP)"
 	@echo "  TARGET=$(TARGET)"
 	@echo "  CPU_TARGET=$(CPU_TARGET)"
-

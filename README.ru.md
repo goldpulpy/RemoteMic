@@ -193,21 +193,27 @@ RemoteMic спроектирован как живой микрофон, а не
 <details open>
 <summary><strong>Установить готовый бинарный файл</strong></summary>
 
-Скачайте последнюю версию бинарного файла:
+Установите последний релиз в `~/.local/bin` (загрузка проверяется по SHA-256):
 
 ```bash
-curl -L https://github.com/goldpulpy/RemoteMic/releases/download/latest/remotemic -o remotemic
-chmod +x remotemic
-sudo mv remotemic /usr/local/bin/remotemic
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh
 ```
 
-Через `wget`:
+Чтобы установить конкретную версию:
 
 ```bash
-wget https://github.com/goldpulpy/RemoteMic/releases/download/latest/remotemic
-chmod +x remotemic
-sudo mv remotemic /usr/local/bin/remotemic
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh -s -- --version 1.2.3
 ```
+
+Установщик проверяет наличие `pactl`, `libpulse.so.0` и `libasound.so.2`. Если
+чего-то не хватает, он запрашивает подтверждение и устанавливает нужные пакеты
+через APT (Debian/Ubuntu), DNF или YUM (Fedora и производные RHEL), Pacman
+(производные Arch), Zypper (openSUSE/SUSE) либо APK (Alpine). Для установки без
+вопросов передайте `--yes`, а `--skip-dependencies` установит только RemoteMic.
+
+Другой каталог можно выбрать через `--install-dir /usr/local/bin` (для записи
+в системный каталог скачанный скрипт может потребоваться запустить с повышенными
+правами).
 
 </details>
 

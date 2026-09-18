@@ -1,5 +1,12 @@
 name: Rust CI
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 on:
   pull_request:
     branches: ["main"]
@@ -8,7 +15,18 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
-      - ".github/workflows/ci.yml"
+      - "scripts/**"
+      - ".github/workflows/**"
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - "scripts/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -50,3 +68,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+
+  installer:
+    name: installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint installer
+        run: shellcheck scripts/install.sh
+      - name: Check installer dependencies
+        run: sh scripts/install.sh --yes --dependencies-only

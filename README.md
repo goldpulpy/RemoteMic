@@ -193,21 +193,27 @@ No public tunnel or internet connection is required for a same-network setup.
 <details open>
 <summary><strong>Install a prebuilt binary</strong></summary>
 
-Download the latest binary:
+Install the latest release into `~/.local/bin` (the download is verified with
+SHA-256):
 
 ```bash
-curl -L https://github.com/goldpulpy/RemoteMic/releases/download/latest/remotemic -o remotemic
-chmod +x remotemic
-sudo mv remotemic /usr/local/bin/remotemic
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh
 ```
 
-With `wget`:
+Install a specific version:
 
 ```bash
-wget https://github.com/goldpulpy/RemoteMic/releases/download/latest/remotemic
-chmod +x remotemic
-sudo mv remotemic /usr/local/bin/remotemic
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh -s -- --version 1.2.3
 ```
+
+The installer checks `pactl`, `libpulse.so.0`, and `libasound.so.2`. If any are
+missing, it asks before installing the appropriate packages through APT
+(Debian/Ubuntu), DNF or YUM (Fedora/RHEL derivatives), Pacman (Arch derivatives),
+Zypper (openSUSE/SUSE), or APK (Alpine). Pass `--yes` for unattended dependency
+installation or `--skip-dependencies` to install only the RemoteMic binary.
+
+Use `--install-dir /usr/local/bin` to choose another destination (you may need
+to run the downloaded script with elevated permissions for system directories).
 
 </details>
 
