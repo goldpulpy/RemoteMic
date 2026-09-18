@@ -111,10 +111,10 @@ The data path is:
 6. The server passes current-session frames into the FIFO without applying a
    codec, gain, filtering, or mixing of its own.
 
-The FIFO and the local CA are stored in `$XDG_RUNTIME_DIR/remotemic` when
-available. Otherwise, RemoteMic uses `$TMPDIR/remotemic-<uid>`. The parent
-directory is created with mode `0700`, and the CA private key is written with
-mode `0600`.
+The FIFO is stored in `$XDG_RUNTIME_DIR/remotemic` when available; otherwise,
+RemoteMic uses `$TMPDIR/remotemic-<uid>`. The local CA is kept across reboots in
+`~/.local/share/remotemic`. Both application directories are created with mode
+`0700`, and the CA private key is written with mode `0600`.
 
 ### Real-time behavior
 
@@ -211,7 +211,7 @@ Usage: remotemic [OPTIONS]
 
 Options:
   -b, --bind <ADDRESS>       Bind to this IP address (default: 0.0.0.0)
-  -p, --port <PORT>          Listen on this port (default: random)
+  -p, --port <PORT>          Listen on this port (default: 59152)
   -q, --quality <QUALITY>    low: 16 kHz/16-bit
                              standard: 24 kHz/16-bit (default)
                              high: 48 kHz/32-bit float
@@ -222,8 +222,7 @@ Options:
   -V, --version              Print version
 ```
 
-With no arguments, RemoteMic selects a random available port in the dynamic
-port range and uses standard quality:
+With no arguments, RemoteMic listens on port `59152` and uses standard quality:
 
 ```bash
 remotemic
@@ -314,11 +313,11 @@ with `Ctrl+C`; it will unload the virtual source and remove its FIFO.
 ### 1. Start RemoteMic
 
 ```bash
-remotemic --port 9000 --quality high
+remotemic --quality high
 ```
 
 For speech over a slower network, use `--quality low`. On startup RemoteMic
-prints an HTTPS URL such as `https://192.168.1.10:9000` and the path to
+prints an HTTPS URL such as `https://192.168.1.10:59152` and the path to
 `remotemic-ca.crt`.
 
 ### 2. Trust the local certificate
@@ -327,8 +326,16 @@ The page is served over HTTPS with a certificate signed by RemoteMic's local CA.
 The sending device must trust that CA, otherwise the browser may block
 microphone access or refuse the connection.
 
-Download the certificate from the running server (`https://<computer-ip>:9000/remotemic-ca.crt`)
-or copy the file from the path printed at startup, then import it:
+On the first visit, the browser will show a certificate or privacy warning
+because the local CA is not trusted yet. Verify that the URL is the local
+RemoteMic address printed in the terminal, then choose the browser's
+**Advanced** and **Proceed** (or **Accept the risk and continue**) option once.
+The exact wording depends on the browser.
+
+After the page opens, press **Download CA certificate**. Alternatively, download
+it directly from
+`https://<computer-ip>:59152/remotemic-ca.crt` or copy the file from the path
+printed at startup. Then import it:
 
 <details open>
 <summary><strong>Android</strong></summary>
@@ -356,6 +363,9 @@ trusted root CA, then restart the browser.
 
 </details>
 
+After installing the CA, fully close and reopen the browser. Future visits to
+the same RemoteMic address should open without the certificate warning.
+
 > [!IMPORTANT]
 > The certificate is signed by a CA generated on this computer. Install it only
 > if you control the machine running RemoteMic and trust it. The CA private key
@@ -370,8 +380,8 @@ trusted root CA, then restart the browser.
 
 **Disconnect** (the button toggles to **Disconnect** while connected) stops the
 browser tracks, closes the WebRTC connection and signaling WebSocket, and allows
-another device to connect. There is no separate mute button; disconnect the
-microphone to stop sending.
+another device to connect. **Mute** temporarily silences the current stream
+without ending the session.
 
 ### 4. Select the virtual microphone
 
@@ -389,6 +399,67 @@ Inspect its negotiated details:
 ```bash
 pactl list sources
 ```
+
+## Uninstallation
+
+### Remove the certificate from sending devices
+
+The certificate is listed as **RemoteMic Local CA** in the device's trusted
+certificate store. Remove it from every device on which it was installed:
+
+<details open>
+<summary><strong>Android</strong></summary>
+
+Open **Settings → Security & privacy → More security settings → Encryption &
+credentials → Trusted credentials**, select the **User** tab, open
+**RemoteMic Local CA**, and remove or disable it. Menu names vary by Android
+version and device manufacturer; searching Settings for “credentials” or
+“certificates” usually opens the correct screen.
+
+</details>
+
+<details>
+<summary><strong>iOS / iPadOS</strong></summary>
+
+Open **Settings → General → VPN & Device Management**, select the profile that
+contains **RemoteMic Local CA**, and press **Remove Profile**. If it is still
+listed under **Settings → General → About → Certificate Trust Settings**, turn
+off full trust for it.
+
+</details>
+
+<details>
+<summary><strong>Desktop browsers</strong></summary>
+
+Remove **RemoteMic Local CA** from the same operating-system or browser
+certificate store into which it was imported. Look under trusted root or
+certificate-authority entries, then fully restart the browser.
+
+</details>
+
+### Uninstall RemoteMic from Linux
+
+Stop RemoteMic with `Ctrl+C`, then remove the prebuilt binary installed by the
+commands in this README:
+
+```bash
+sudo rm /usr/local/bin/remotemic
+```
+
+Remove the persistent local CA, its private key, and the RemoteMic data
+directory:
+
+```bash
+rm -r -- "$HOME/.local/share/remotemic"
+```
+
+If RemoteMic was built from source instead of installed into `/usr/local/bin`,
+remove the cloned repository or whichever binary you copied manually.
+
+> [!IMPORTANT]
+> Removing `~/.local/share/remotemic` permanently deletes the local CA private
+> key. If RemoteMic is run again, it will generate a new CA that must be
+> installed on every sending device again.
 
 ## Choosing a quality mode
 
@@ -445,8 +516,8 @@ network packet loss.
   TURN servers.
 
 The local CA is only as trustworthy as the computer that generated it. Anyone
-who obtains the CA private key can impersonate RemoteMic, so keep the runtime
-directory private and do not copy the key off the machine. Use a trusted
+who obtains the CA private key can impersonate RemoteMic, so keep the persistent
+data directory private and do not copy the key off the machine. Use a trusted
 network, restrict access where possible, and do not publish the URL. RemoteMic
 does not store recordings or intentionally write captured audio to disk.
 

@@ -357,7 +357,8 @@ pub const HTML: &str = r#"
       button#btn:active {
         transform: scale(0.98);
       }
-      button:focus-visible {
+      button:focus-visible,
+      .cert-download:focus-visible {
         outline: 3px solid color-mix(in srgb, var(--ok) 45%, transparent);
         outline-offset: 3px;
       }
@@ -417,6 +418,37 @@ pub const HTML: &str = r#"
       }
       button#mute-btn.muted:hover {
         opacity: 0.8;
+      }
+      .cert-download {
+        min-height: 44px;
+        padding: 11px 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        font-size: 0.7rem;
+        font-weight: 500;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        text-decoration: none;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: transparent;
+        color: var(--muted);
+        transition:
+          background 0.15s,
+          color 0.15s,
+          border-color 0.15s,
+          transform 0.1s;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .cert-download:hover {
+        background: var(--ok-bg);
+        color: var(--ok);
+        border-color: var(--ok);
+      }
+      .cert-download:active {
+        transform: scale(0.98);
       }
       .hint {
         font-size: 0.67rem;
@@ -556,6 +588,30 @@ pub const HTML: &str = r#"
           <span id="mute-label">Mute</span>
         </button>
       </div>
+
+      <a
+        id="cert-download"
+        class="cert-download"
+        href="/remotemic-ca.crt"
+        download="remotemic-ca.crt"
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 3v12" />
+          <path d="m7 10 5 5 5-5" />
+          <path d="M5 21h14" />
+        </svg>
+        Download CA certificate
+      </a>
 
       <p class="hint">
         Your microphone is used only while this page is connected.

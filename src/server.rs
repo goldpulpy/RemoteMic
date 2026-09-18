@@ -761,6 +761,17 @@ mod tests {
         assert!(html.contains("a=ptime:10"));
     }
 
+    #[test]
+    fn page_includes_ca_certificate_download_button() {
+        let html = render_page("test-token", AudioConfig::STANDARD);
+        assert!(html.contains(
+            r#"id="cert-download"
+        class="cert-download"
+        href="/remotemic-ca.crt"
+        download="remotemic-ca.crt""#
+        ));
+    }
+
     #[tokio::test]
     async fn full_audio_queue_replaces_oldest_frame() {
         let (sender, receiver) = audio_frame_channel(1);

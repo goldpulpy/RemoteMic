@@ -18,6 +18,7 @@ use tracing_subscriber::FmtSubscriber;
 use tracing_subscriber::filter::LevelFilter;
 
 const DEFAULT_QUEUE_SIZE: usize = 1;
+const DEFAULT_PORT: u16 = 59_152;
 const MAX_QUEUE_SIZE: usize = 1_024;
 const LOW_LATENCY_PIPE_SIZE_BYTES: i32 = 4_096;
 const CONTAINER_RANK: u8 = 3;
@@ -109,10 +110,8 @@ async fn run_service(
     let listen_addr = listener.local_addr()?;
     let port = listen_addr.port();
     let advertised_ips = advertised_addresses(listen_addr.ip())?;
-    let certificate_dir = pipe_path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("audio pipe has no parent directory"))?;
-    let local_tls = tls::prepare(certificate_dir, &advertised_ips)
+    let certificate_dir = tls::certificate_directory().map_err(std::io::Error::other)?;
+    let local_tls = tls::prepare(&certificate_dir, &advertised_ips)
         .await
         .map_err(std::io::Error::other)?;
     info!("RemoteMic starting on {listen_addr}");
@@ -162,31 +161,10 @@ async fn run_service(
 
 async fn bind_listener(
     address: IpAddr,
-    port: Option<u16>,
+    port: u16,
 ) -> Result<tokio::net::TcpListener, std::io::Error> {
-    match port {
-        Some(port) => {
-            debug!(%address, port, "Binding requested listen address");
-            tokio::net::TcpListener::bind((address, port)).await
-        }
-        None => {
-            debug!(%address, "Selecting a random dynamic port");
-            loop {
-                let candidate = rand::random_range(49152..=65535);
-                trace!(%address, port = candidate, "Trying listen address");
-                match tokio::net::TcpListener::bind((address, candidate)).await {
-                    Ok(listener) => {
-                        debug!(%address, port = candidate, "Selected random listen port");
-                        return Ok(listener);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                        trace!(%address, port = candidate, "Random listen port is already in use");
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
+    debug!(%address, port, "Binding listen address");
+    tokio::net::TcpListener::bind((address, port)).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,7 +195,7 @@ impl Quality {
 #[derive(Debug, Eq, PartialEq)]
 struct Options {
     bind: IpAddr,
-    port: Option<u16>,
+    port: u16,
     quality: Quality,
     source_name: String,
     queue_size: usize,
@@ -230,7 +208,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
     let mut args = args.into_iter();
     let mut options = Options {
         bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        port: None,
+        port: DEFAULT_PORT,
         quality: Quality::Standard,
         source_name: "RemoteMic".to_string(),
         queue_size: DEFAULT_QUEUE_SIZE,
@@ -249,10 +227,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
             }
             "-p" | "--port" => {
                 let value = next_value(&mut args, "-p/--port")?;
-                options.port =
-                    Some(value.parse::<u16>().map_err(|_| {
-                        format!("Invalid port \"{value}\": expected a number 0-65535")
-                    })?);
+                options.port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("Invalid port \"{value}\": expected a number 0-65535"))?;
             }
             "-q" | "--quality" => {
                 let value = next_value(&mut args, "-q/--quality")?;
@@ -332,7 +309,7 @@ fn usage() -> &'static str {
 
 Options:
   -b, --bind <ADDRESS>       Bind to this IP address (default: 0.0.0.0)
-  -p, --port <PORT>          Listen on this port (default: random)
+  -p, --port <PORT>          Listen on this port (default: 59152)
   -q, --quality <QUALITY>    low: 16 kHz/16-bit
                              standard: 24 kHz/16-bit (default)
                              high: 48 kHz/32-bit float
@@ -609,8 +586,8 @@ fn limit_pipe_buffer(writer: &pipe::Sender) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_QUEUE_SIZE, Options, Quality, advertised_addresses, interface_rank, parse_args,
-        url_host, usable_ipv4,
+        DEFAULT_PORT, DEFAULT_QUEUE_SIZE, Options, Quality, advertised_addresses, interface_rank,
+        parse_args, url_host, usable_ipv4,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use tracing_subscriber::filter::LevelFilter;
@@ -622,7 +599,7 @@ mod tests {
     fn default_options() -> Options {
         Options {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            port: None,
+            port: DEFAULT_PORT,
             quality: Quality::Standard,
             source_name: "RemoteMic".to_string(),
             queue_size: DEFAULT_QUEUE_SIZE,
@@ -638,9 +615,14 @@ mod tests {
     }
 
     #[test]
+    fn defaults_to_stable_service_port() {
+        assert_eq!(parse_args(Vec::new()).unwrap().port, 59_152);
+    }
+
+    #[test]
     fn parses_high_quality_and_port() {
         let expected = Options {
-            port: Some(9000),
+            port: 9000,
             quality: Quality::High,
             ..default_options()
         };

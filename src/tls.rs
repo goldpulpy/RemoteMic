@@ -3,13 +3,25 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
+use std::ffi::OsStr;
 use std::net::IpAddr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
 const CA_CERT_FILE: &str = "remotemic-ca.crt";
 const CA_KEY_FILE: &str = "remotemic-ca.key";
+
+pub fn certificate_directory() -> Result<PathBuf, String> {
+    certificate_directory_from(std::env::var_os("HOME").as_deref()).ok_or_else(|| {
+        "Could not determine persistent certificate directory: HOME is unset".to_string()
+    })
+}
+
+fn certificate_directory_from(home: Option<&OsStr>) -> Option<PathBuf> {
+    home.filter(|directory| !directory.is_empty())
+        .map(|directory| PathBuf::from(directory).join(".local/share/remotemic"))
+}
 
 pub struct LocalTls {
     pub config: RustlsConfig,
@@ -18,6 +30,7 @@ pub struct LocalTls {
 }
 
 pub async fn prepare(directory: &Path, server_ips: &[IpAddr]) -> Result<LocalTls, String> {
+    ensure_private_directory(directory)?;
     let ca_path = directory.join(CA_CERT_FILE);
     let ca_key_path = directory.join(CA_KEY_FILE);
     let (ca_pem, ca_key_pem) = load_or_create_ca(&ca_path, &ca_key_path)?;
@@ -62,6 +75,41 @@ pub async fn prepare(directory: &Path, server_ips: &[IpAddr]) -> Result<LocalTls
         ca_der,
         ca_path,
     })
+}
+
+fn ensure_private_directory(directory: &Path) -> Result<(), String> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+
+    let metadata = std::fs::symlink_metadata(directory)
+        .map_err(|error| format!("Could not inspect {}: {error}", directory.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!("{} is not a directory", directory.display()));
+    }
+
+    let uid = std::fs::metadata("/proc/self")
+        .map_err(|error| format!("Could not determine the current user: {error}"))?
+        .uid();
+    if metadata.uid() != uid {
+        return Err(format!(
+            "Unsafe certificate directory {}: owned by uid {}, expected uid {uid}",
+            directory.display(),
+            metadata.uid()
+        ));
+    }
+
+    let permissions = metadata.mode() & 0o777;
+    if permissions != 0o700 {
+        return Err(format!(
+            "Unsafe certificate directory {}: permissions are {permissions:#o}, expected 0o700",
+            directory.display()
+        ));
+    }
+
+    Ok(())
 }
 
 fn load_or_create_ca(cert_path: &Path, key_path: &Path) -> Result<(String, String), String> {
@@ -126,7 +174,8 @@ fn pem_certificate_to_der(pem: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::prepare;
+    use super::{certificate_directory_from, prepare};
+    use std::ffi::OsStr;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[tokio::test]
@@ -136,7 +185,6 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ));
-        std::fs::create_dir(&directory).unwrap();
 
         let first = prepare(&directory, &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))])
             .await
@@ -147,5 +195,20 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
 
         assert_eq!(first.ca_der, second.ca_der);
+    }
+
+    #[test]
+    fn certificate_directory_uses_local_share_in_home() {
+        let directory = certificate_directory_from(Some(OsStr::new("/home/example")));
+
+        assert_eq!(
+            directory,
+            Some("/home/example/.local/share/remotemic".into())
+        );
+    }
+
+    #[test]
+    fn certificate_directory_is_unavailable_without_home() {
+        assert_eq!(certificate_directory_from(None), None);
     }
 }
