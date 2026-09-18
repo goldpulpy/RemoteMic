@@ -5,6 +5,7 @@ set -eu
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "${TEST_ROOT}"' EXIT HUP INT TERM
 
+set +e
 OUTPUT="$(
     # Variables in this block are intentionally expanded by the isolated child shell.
     # shellcheck disable=SC2016
@@ -40,7 +41,10 @@ OUTPUT="$(
         . scripts/install.sh
     ' 2>&1
 )"
+STATUS="$?"
+set -e
 
+test "${STATUS}" -ne 0
 test -x "${TEST_ROOT}/bin/remotemic"
 test -f "${TEST_ROOT}/config/systemd/user/remotemic.service"
 printf '%s\n' "${OUTPUT}" | grep -Fq "WARNING: The systemd user session is unavailable."

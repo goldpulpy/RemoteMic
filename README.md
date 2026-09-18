@@ -439,7 +439,8 @@ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulp
 The installer detects systemd, OpenRC, and runit automatically. This covers the
 usual Fedora, Debian, Ubuntu, openSUSE, Arch, Alpine, Gentoo, Void, and related
 setups. If none can be configured, it prints a warning and keeps the successful
-RemoteMic installation instead of failing.
+RemoteMic binary installation, but returns a non-zero status so scripts can
+detect that autostart was not enabled.
 
 For manual systemd setup, create
 `~/.config/systemd/user/remotemic.service` with the following contents:

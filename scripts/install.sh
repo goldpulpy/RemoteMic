@@ -443,7 +443,11 @@ respawn_max=0
 output_log="/var/log/remotemic.log"
 error_log="/var/log/remotemic.log"
 export HOME="${escaped_home}"
-export XDG_RUNTIME_DIR="/run/user/${service_uid}"
+if [ -d "/run/user/${service_uid}" ]; then
+    export XDG_RUNTIME_DIR="/run/user/${service_uid}"
+else
+    unset XDG_RUNTIME_DIR
+fi
 
 depend() {
     need net
@@ -508,7 +512,11 @@ enable_runit_autostart() {
 #!/bin/sh
 exec 2>&1
 export HOME="${escaped_home}"
-export XDG_RUNTIME_DIR="/run/user/${service_uid}"
+if [ -d "/run/user/${service_uid}" ]; then
+    export XDG_RUNTIME_DIR="/run/user/${service_uid}"
+else
+    unset XDG_RUNTIME_DIR
+fi
 cd "${escaped_home}"
 exec chpst -u "${service_user}:${service_group}" "${escaped_binary_path}"
 EOF
@@ -572,7 +580,7 @@ enable_autostart() {
     echo "WARNING: No supported service manager could be configured." >&2
     echo "RemoteMic was installed successfully without autostart." >&2
     echo "Supported managers: systemd, OpenRC, and runit." >&2
-    return 0
+    return 1
 }
 
 if [ "${AUTOSTART}" = "true" ]; then

@@ -2,25 +2,30 @@ use std::path::PathBuf;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub async fn check_pactl() -> Result<(), String> {
     debug!("Checking pactl availability");
-    match Command::new("pactl").arg("--version").output().await {
-        Ok(output) if output.status.success() => {
+    let mut command = Command::new("pactl");
+    command.arg("--version").kill_on_drop(true);
+    match tokio::time::timeout(COMMAND_TIMEOUT, command.output()).await {
+        Err(_) => Err("pactl --version timed out".to_string()),
+        Ok(Ok(output)) if output.status.success() => {
             info!("pactl: OK");
             Ok(())
         }
-        Ok(output) => Err(format!(
+        Ok(Ok(output)) => Err(format!(
             "pactl is present but not working (exit status {})",
             output.status
         )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             Err("pactl not found. Install PulseAudio or PipeWire-pulse:\n  \
              Debian/Ubuntu: sudo apt install pulseaudio-utils\n  \
              Fedora:        sudo dnf install pulseaudio-utils\n  \
              Arch:          sudo pacman -S libpulse"
                 .to_string())
         }
-        Err(e) => Err(format!("pactl could not be executed: {e}")),
+        Ok(Err(e)) => Err(format!("pactl could not be executed: {e}")),
     }
 }
 
@@ -57,7 +62,12 @@ pub async fn check_audio_libs() {
 
 async fn ldconfig_cache() -> Option<String> {
     debug!("Reading dynamic linker cache with ldconfig");
-    let output = Command::new("ldconfig").arg("-p").output().await.ok()?;
+    let mut command = Command::new("ldconfig");
+    command.arg("-p").kill_on_drop(true);
+    let output = tokio::time::timeout(COMMAND_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
     output
         .status
         .success()

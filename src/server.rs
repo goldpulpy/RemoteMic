@@ -37,7 +37,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tracing::{debug, error, info, trace, warn};
 use webrtc::{
     media_stream::track_remote::{TrackRemote, TrackRemoteEvent},
@@ -57,6 +57,7 @@ const ACQUIRE_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
 const ACQUIRE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SIGNALING_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const CONNECTION_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
+const DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(15);
 const CODEC_LOOKUP_ATTEMPTS: usize = 25;
 const CODEC_LOOKUP_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_PLC_PACKETS: u16 = 3;
@@ -415,7 +416,7 @@ struct WebRtcHandler {
     metrics: StreamMetrics,
     metrics_hub: MetricsHub,
     gather_complete: Arc<Notify>,
-    connected: Arc<Notify>,
+    connection_state: watch::Sender<RTCPeerConnectionState>,
 }
 
 impl WebRtcHandler {
@@ -436,14 +437,7 @@ impl PeerConnectionEventHandler for WebRtcHandler {
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         info!(session_id = self.session_id, %state, "WebRTC connection state changed");
-        if matches!(
-            state,
-            RTCPeerConnectionState::Connected
-                | RTCPeerConnectionState::Failed
-                | RTCPeerConnectionState::Closed
-        ) {
-            self.connected.notify_one();
-        }
+        self.connection_state.send_replace(state);
         if matches!(
             state,
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
@@ -504,7 +498,8 @@ async fn handle_socket(socket: WebSocket, state: Server) {
     let metrics = StreamMetrics::default();
     state.metrics.install(&metrics);
     let gather_complete = Arc::new(Notify::new());
-    let connected = Arc::new(Notify::new());
+    let (connection_state_tx, mut connection_state_rx) =
+        watch::channel(RTCPeerConnectionState::New);
     let handler = Arc::new(WebRtcHandler {
         session_id,
         audio_tx: state.audio_tx.clone(),
@@ -513,7 +508,7 @@ async fn handle_socket(socket: WebSocket, state: Server) {
         metrics,
         metrics_hub: state.metrics.clone(),
         gather_complete: Arc::clone(&gather_complete),
-        connected: Arc::clone(&connected),
+        connection_state: connection_state_tx,
     });
     let peer =
         match create_peer_connection(Arc::clone(&handler), state.ice_udp_addrs.to_vec()).await {
@@ -544,27 +539,84 @@ async fn handle_socket(socket: WebSocket, state: Server) {
         close_peer(&peer, &handler).await;
         return;
     }
-    if tokio::time::timeout(CONNECTION_ESTABLISH_TIMEOUT, connected.notified())
-        .await
-        .is_err()
+    match tokio::time::timeout(
+        CONNECTION_ESTABLISH_TIMEOUT,
+        wait_for_connected(&mut connection_state_rx),
+    )
+    .await
     {
-        send_error(&mut sender, "timed out establishing WebRTC connection").await;
-        close_peer(&peer, &handler).await;
-        return;
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            send_error(&mut sender, error).await;
+            close_peer(&peer, &handler).await;
+            return;
+        }
+        Err(_) => {
+            send_error(&mut sender, "timed out establishing WebRTC connection").await;
+            close_peer(&peer, &handler).await;
+            return;
+        }
     }
 
-    while let Some(message) = receiver.next().await {
-        match message {
-            Ok(Message::Close(_)) => break,
-            Err(error) => {
-                debug!(session_id, %error, "Signaling WebSocket ended");
-                break;
+    loop {
+        tokio::select! {
+            message = receiver.next() => match message {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(error)) => {
+                    debug!(session_id, %error, "Signaling WebSocket ended");
+                    break;
+                }
+                _ => {}
+            },
+            changed = connection_state_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let state = *connection_state_rx.borrow_and_update();
+                match state {
+                    RTCPeerConnectionState::Disconnected => {
+                        match tokio::time::timeout(
+                            DISCONNECTED_TIMEOUT,
+                            wait_for_connected(&mut connection_state_rx),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                send_error(&mut sender, error).await;
+                                break;
+                            }
+                            Err(_) => {
+                                send_error(&mut sender, "WebRTC connection remained disconnected").await;
+                                break;
+                            }
+                        }
+                    }
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => break,
+                    _ => {}
+                }
             }
-            _ => {}
         }
     }
     close_peer(&peer, &handler).await;
     info!(session_id, "WebRTC session ended");
+}
+
+async fn wait_for_connected(
+    states: &mut watch::Receiver<RTCPeerConnectionState>,
+) -> Result<(), &'static str> {
+    loop {
+        match *states.borrow_and_update() {
+            RTCPeerConnectionState::Connected => return Ok(()),
+            RTCPeerConnectionState::Failed => return Err("WebRTC connection failed"),
+            RTCPeerConnectionState::Closed => return Err("WebRTC connection closed"),
+            _ => {}
+        }
+        states
+            .changed()
+            .await
+            .map_err(|_| "WebRTC connection state channel closed")?;
+    }
 }
 
 async fn create_peer_connection(
@@ -700,11 +752,6 @@ async fn receive_opus_track(
             break;
         }
         let now = Instant::now();
-        handler
-            .metrics
-            .0
-            .packets_received
-            .fetch_add(1, Ordering::Relaxed);
         if let Some(previous) = sequence {
             let Some(delta) = forward_sequence_delta(previous, packet.header.sequence_number)
             else {
@@ -734,6 +781,11 @@ async fn receive_opus_track(
                 }
             }
         }
+        handler
+            .metrics
+            .0
+            .packets_received
+            .fetch_add(1, Ordering::Relaxed);
         update_jitter(
             &handler.metrics,
             packet.header.timestamp,
@@ -851,19 +903,21 @@ fn forward_sequence_delta(previous: u16, current: u16) -> Option<u16> {
 }
 
 fn ice_udp_addrs(bind: IpAddr) -> Vec<String> {
-    let mut addrs = vec!["0.0.0.0:0".to_owned()];
-    if bind.is_ipv6() {
-        addrs.push("[::]:0".to_owned());
+    match bind {
+        IpAddr::V4(address) => vec![format!("{address}:0")],
+        IpAddr::V6(address) if address.is_unspecified() => {
+            vec!["0.0.0.0:0".to_owned(), "[::]:0".to_owned()]
+        }
+        IpAddr::V6(address) => vec![format!("[{address}]:0")],
     }
-    addrs
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioFrame, MetricsHub, SessionRegistry, StreamMetrics, audio_frame_channel,
-        concealment_toc, constant_time_eq, forward_sequence_delta, has_opus_payload, ice_udp_addrs,
-        render_page,
+        AudioFrame, MetricsHub, RTCPeerConnectionState, SessionRegistry, StreamMetrics,
+        audio_frame_channel, concealment_toc, constant_time_eq, forward_sequence_delta,
+        has_opus_payload, ice_udp_addrs, render_page, wait_for_connected,
     };
     use crate::audio::AudioConfig;
     use std::sync::atomic::Ordering;
@@ -905,6 +959,26 @@ mod tests {
         assert!(sessions.is_active(second));
     }
 
+    #[tokio::test]
+    async fn failed_peer_does_not_satisfy_connected_waiter() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(RTCPeerConnectionState::New);
+        sender.send_replace(RTCPeerConnectionState::Failed);
+
+        assert_eq!(
+            wait_for_connected(&mut receiver).await,
+            Err("WebRTC connection failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_peer_can_recover_before_timeout() {
+        let (sender, mut receiver) =
+            tokio::sync::watch::channel(RTCPeerConnectionState::Disconnected);
+        sender.send_replace(RTCPeerConnectionState::Connected);
+
+        assert_eq!(wait_for_connected(&mut receiver).await, Ok(()));
+    }
+
     #[test]
     fn metrics_reports_packet_loss_percentage() {
         let metrics = StreamMetrics::default();
@@ -943,7 +1017,18 @@ mod tests {
         let audio_setup = html.find("await audioContext.resume();").unwrap();
 
         assert!(registration < audio_setup);
-        assert!(html.contains("activeSession.stream.getTracks().forEach((track) => track.stop())"));
+        assert!(
+            html.contains("activeSession.stream?.getTracks().forEach((track) => track.stop())")
+        );
+    }
+
+    #[test]
+    fn page_releases_wake_lock_obtained_after_disconnect() {
+        let html = render_page("test-token", AudioConfig::STANDARD);
+
+        assert!(html.contains("!isCurrentSession(activeSession) ||"));
+        assert!(html.contains("await lock.release().catch(() => {});"));
+        assert!(html.contains("if (!isCurrentSession(activeSession)) return;"));
     }
 
     #[tokio::test]
@@ -987,5 +1072,15 @@ mod tests {
     #[test]
     fn ipv4_listener_uses_only_ipv4_ice_socket() {
         assert_eq!(ice_udp_addrs("0.0.0.0".parse().unwrap()), ["0.0.0.0:0"]);
+    }
+
+    #[test]
+    fn concrete_listener_limits_ice_to_the_same_interface() {
+        assert_eq!(ice_udp_addrs("127.0.0.1".parse().unwrap()), ["127.0.0.1:0"]);
+    }
+
+    #[test]
+    fn concrete_ipv6_listener_limits_ice_to_the_same_interface() {
+        assert_eq!(ice_udp_addrs("::1".parse().unwrap()), ["[::1]:0"]);
     }
 }

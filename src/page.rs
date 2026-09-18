@@ -651,6 +651,10 @@ pub const HTML: &str = r#"
 
       let session = null;
 
+      function isCurrentSession(activeSession) {
+        return session === activeSession && !activeSession.stopping;
+      }
+
       function setBadge(text, state = "") {
         badge.className = "badge" + (state ? " " + state : "");
         badgeText.textContent = text;
@@ -739,13 +743,25 @@ pub const HTML: &str = r#"
       }
 
       async function acquireWakeLock(activeSession) {
+        if (
+          !isCurrentSession(activeSession) ||
+          activeSession.wakeLock ||
+          activeSession.wakeLockPending
+        ) {
+          return;
+        }
         if (!("wakeLock" in navigator)) {
           wakeState.textContent = "Unavailable";
           wakeWarning.classList.add("visible");
           return;
         }
+        activeSession.wakeLockPending = true;
         try {
           const lock = await navigator.wakeLock.request("screen");
+          if (!isCurrentSession(activeSession) || activeSession.wakeLock) {
+            await lock.release().catch(() => {});
+            return;
+          }
           activeSession.wakeLock = lock;
           wakeState.textContent = "Kept awake";
           lock.addEventListener("release", () => {
@@ -758,8 +774,12 @@ pub const HTML: &str = r#"
           });
         } catch (error) {
           console.debug("Wake lock unavailable", error);
-          wakeState.textContent = "Unavailable";
-          wakeWarning.classList.add("visible");
+          if (isCurrentSession(activeSession)) {
+            wakeState.textContent = "Unavailable";
+            wakeWarning.classList.add("visible");
+          }
+        } finally {
+          activeSession.wakeLockPending = false;
         }
       }
 
@@ -836,19 +856,8 @@ pub const HTML: &str = r#"
         micState.textContent = "Waiting for permission";
         wakeWarning.classList.remove("visible");
 
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            sampleRate: { ideal: 48000 },
-            channelCount: { exact: 1 },
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-            latency: { ideal: 0.01 },
-          },
-          video: false,
-        });
         const activeSession = {
-          stream,
+          stream: null,
           track: null,
           audioContext: null,
           source: null,
@@ -860,122 +869,155 @@ pub const HTML: &str = r#"
           metricsTimer: null,
           answerTimer: null,
           animationFrame: null,
+          wakeLockPending: false,
           stopping: false,
           muted: false,
         };
-        // Register captured media immediately so stop() can release it if any
-        // later setup step fails.
+        // Register the attempt before the permission prompt so pagehide can
+        // cancel it even when getUserMedia is still pending.
         session = activeSession;
 
-        const track = stream.getAudioTracks()[0];
-        activeSession.track = track;
-        if ("contentHint" in track) track.contentHint = "music";
-
-        const AudioContextClass =
-          window.AudioContext || window.webkitAudioContext;
-        let audioContext;
         try {
-          audioContext = new AudioContextClass({ sampleRate: 48000 });
-        } catch (error) {
-          console.debug("Falling back to the default AudioContext rate", error);
-          audioContext = new AudioContextClass();
-        }
-        activeSession.audioContext = audioContext;
-        await audioContext.resume();
-        const source = audioContext.createMediaStreamSource(stream);
-        activeSession.source = source;
-        const analyser = audioContext.createAnalyser();
-        activeSession.analyser = analyser;
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.72;
-        const silentGain = audioContext.createGain();
-        activeSession.silentGain = silentGain;
-        silentGain.gain.value = 0;
-        source.connect(analyser);
-        analyser.connect(silentGain);
-        silentGain.connect(audioContext.destination);
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              sampleRate: { ideal: 48000 },
+              channelCount: { exact: 1 },
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+              latency: { ideal: 0.01 },
+            },
+            video: false,
+          });
+          if (!isCurrentSession(activeSession)) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+          }
+          activeSession.stream = stream;
 
-        const peer = new RTCPeerConnection({
-          iceServers: [],
-          bundlePolicy: "max-bundle",
-        });
-        activeSession.peer = peer;
-        const sender = peer.addTrack(track, stream);
-        preferOpus(peer);
-        await tuneSender(sender);
+          const track = stream.getAudioTracks()[0];
+          if (!track) throw new Error("Microphone stream has no audio track");
+          activeSession.track = track;
+          if ("contentHint" in track) track.contentHint = "music";
 
-        const socket = new WebSocket(websocketUrl());
-        activeSession.socket = socket;
-
-        socket.addEventListener("message", async ({ data }) => {
-          if (session !== activeSession) return;
+          const AudioContextClass =
+            window.AudioContext || window.webkitAudioContext;
+          let audioContext;
           try {
-            const message = JSON.parse(data);
-            if (message.type === "answer") {
+            audioContext = new AudioContextClass({ sampleRate: 48000 });
+          } catch (error) {
+            console.debug("Falling back to the default AudioContext rate", error);
+            audioContext = new AudioContextClass();
+          }
+          activeSession.audioContext = audioContext;
+          await audioContext.resume();
+          if (!isCurrentSession(activeSession)) return;
+          const source = audioContext.createMediaStreamSource(stream);
+          activeSession.source = source;
+          const analyser = audioContext.createAnalyser();
+          activeSession.analyser = analyser;
+          analyser.fftSize = 256;
+          analyser.smoothingTimeConstant = 0.72;
+          const silentGain = audioContext.createGain();
+          activeSession.silentGain = silentGain;
+          silentGain.gain.value = 0;
+          source.connect(analyser);
+          analyser.connect(silentGain);
+          silentGain.connect(audioContext.destination);
+
+          const peer = new RTCPeerConnection({
+            iceServers: [],
+            bundlePolicy: "max-bundle",
+          });
+          activeSession.peer = peer;
+          const sender = peer.addTrack(track, stream);
+          preferOpus(peer);
+          await tuneSender(sender);
+          if (!isCurrentSession(activeSession)) return;
+
+          const socket = new WebSocket(websocketUrl());
+          activeSession.socket = socket;
+
+          socket.addEventListener("message", async ({ data }) => {
+            if (session !== activeSession) return;
+            try {
+              const message = JSON.parse(data);
+              if (message.type === "answer") {
+                clearTimeout(activeSession.answerTimer);
+                activeSession.answerTimer = null;
+                await peer.setRemoteDescription(message);
+              } else if (message.type === "error") {
+                stop(message.message, true);
+              }
+            } catch (error) {
+              if (isCurrentSession(activeSession)) {
+                stop("Invalid signaling response: " + error.message, true);
+              }
+            }
+          });
+          socket.addEventListener("close", () => {
+            if (session === activeSession && !activeSession.stopping) {
+              stop("Signaling connection closed", true);
+            }
+          });
+          peer.addEventListener("connectionstatechange", () => {
+            if (session !== activeSession) return;
+            if (peer.connectionState === "connected") {
               clearTimeout(activeSession.answerTimer);
               activeSession.answerTimer = null;
-              await peer.setRemoteDescription(message);
-            } else if (message.type === "error") {
-              stop(message.message, true);
+              setBadge("Connected", "connected");
+              streamState.textContent = "WebRTC · Opus · LAN";
+              btn.disabled = false;
+            } else if (
+              ["failed", "closed"].includes(peer.connectionState) &&
+              !activeSession.stopping
+            ) {
+              stop("WebRTC " + peer.connectionState, true);
             }
-          } catch (error) {
-            stop("Invalid signaling response: " + error.message, true);
-          }
-        });
-        socket.addEventListener("close", () => {
-          if (session === activeSession && !activeSession.stopping) {
-            stop("Signaling connection closed", true);
-          }
-        });
-        peer.addEventListener("connectionstatechange", () => {
-          if (session !== activeSession) return;
-          if (peer.connectionState === "connected") {
-            clearTimeout(activeSession.answerTimer);
-            activeSession.answerTimer = null;
-            setBadge("Connected", "connected");
-            streamState.textContent = "WebRTC · Opus · LAN";
-            btn.disabled = false;
-          } else if (
-            ["failed", "closed"].includes(peer.connectionState) &&
-            !activeSession.stopping
-          ) {
-            stop("WebRTC " + peer.connectionState, true);
-          }
-        });
+          });
 
-        await waitForSocket(socket);
-        const offer = tuneOffer(await peer.createOffer());
-        await peer.setLocalDescription(offer);
-        await waitForIceGathering(peer);
-        socket.send(JSON.stringify(peer.localDescription));
-        activeSession.answerTimer = setTimeout(() => {
-          if (session === activeSession && !activeSession.stopping) {
-            stop("WebRTC answer timed out", true);
-          }
-        }, 15000);
+          await waitForSocket(socket);
+          if (!isCurrentSession(activeSession)) return;
+          const offer = tuneOffer(await peer.createOffer());
+          if (!isCurrentSession(activeSession)) return;
+          await peer.setLocalDescription(offer);
+          if (!isCurrentSession(activeSession)) return;
+          await waitForIceGathering(peer);
+          if (!isCurrentSession(activeSession)) return;
+          socket.send(JSON.stringify(peer.localDescription));
+          activeSession.answerTimer = setTimeout(() => {
+            if (session === activeSession && !activeSession.stopping) {
+              stop("WebRTC answer timed out", true);
+            }
+          }, 15000);
 
-        const settings = track.getSettings();
-        const processing = [];
-        if (settings.echoCancellation === true) processing.push("echo cancellation");
-        if (settings.noiseSuppression === true) processing.push("noise suppression");
-        if (settings.autoGainControl === true) processing.push("auto gain");
-        micState.textContent =
-          (settings.sampleRate || 48000) +
-          " Hz · mono · " +
-          (processing.length ? processing.join(", ") + " on" : "processing off");
-        processingWarning.classList.toggle("visible", processing.length > 0);
-        streamState.textContent = "Negotiating WebRTC";
-        btn.textContent = "Disconnect";
-        btn.classList.add("disconnect");
-        btn.disabled = false;
-        muteBtn.classList.add("visible");
-        setBadge("Connecting", "connecting");
-        startMeter(activeSession);
-        await acquireWakeLock(activeSession);
-        activeSession.metricsTimer = setInterval(
-          () => updateMetrics(activeSession),
-          1000,
-        );
+          const settings = track.getSettings();
+          const processing = [];
+          if (settings.echoCancellation === true) processing.push("echo cancellation");
+          if (settings.noiseSuppression === true) processing.push("noise suppression");
+          if (settings.autoGainControl === true) processing.push("auto gain");
+          micState.textContent =
+            (settings.sampleRate || 48000) +
+            " Hz · mono · " +
+            (processing.length ? processing.join(", ") + " on" : "processing off");
+          processingWarning.classList.toggle("visible", processing.length > 0);
+          streamState.textContent = "Negotiating WebRTC";
+          btn.textContent = "Disconnect";
+          btn.classList.add("disconnect");
+          btn.disabled = false;
+          muteBtn.classList.add("visible");
+          setBadge("Connecting", "connecting");
+          startMeter(activeSession);
+          await acquireWakeLock(activeSession);
+          if (!isCurrentSession(activeSession)) return;
+          activeSession.metricsTimer = setInterval(
+            () => updateMetrics(activeSession),
+            1000,
+          );
+        } catch (error) {
+          if (!isCurrentSession(activeSession)) return;
+          throw error;
+        }
       }
 
       async function stop(reason = "Ready", failed = false) {
@@ -994,7 +1036,7 @@ pub const HTML: &str = r#"
         clearInterval(activeSession.metricsTimer);
         clearTimeout(activeSession.answerTimer);
         cancelAnimationFrame(activeSession.animationFrame);
-        activeSession.stream.getTracks().forEach((track) => track.stop());
+        activeSession.stream?.getTracks().forEach((track) => track.stop());
         activeSession.peer?.close();
         activeSession.socket?.close();
         activeSession.source?.disconnect();

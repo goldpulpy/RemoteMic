@@ -1,11 +1,13 @@
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 const PIPE_FILE_NAME: &str = "remotemic.pipe";
 const LOCK_FILE_NAME: &str = "remotemic.lock";
+const PACTL_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SampleFormat {
@@ -170,26 +172,19 @@ impl VirtualMic {
 
         info!("Loading PulseAudio module-pipe-source");
 
-        let pipe_path = self.pipe_path.clone();
-        let source_name = self.source_name.clone();
         let format_arg = format!("format={}", self.config.sample_format.pulse_name());
         let rate_arg = format!("rate={}", self.config.sample_rate);
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("pactl")
-                .args([
-                    "load-module",
-                    "module-pipe-source",
-                    &format!("source_name={source_name}"),
-                    &format!("file={}", pipe_path.display()),
-                    &format_arg,
-                    &rate_arg,
-                    "channels=1",
-                ])
-                .output()
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking panicked: {e}"))?
-        .map_err(|e| format!("Failed to execute pactl: {e}"))?;
+        let mut command = Command::new("pactl");
+        command.args([
+            "load-module",
+            "module-pipe-source",
+            &format!("source_name={}", self.source_name),
+            &format!("file={}", self.pipe_path.display()),
+            &format_arg,
+            &rate_arg,
+            "channels=1",
+        ]);
+        let output = run_pactl(command, "load-module").await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -201,10 +196,16 @@ impl VirtualMic {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let module_index: u32 = stdout
-            .trim()
-            .parse()
-            .map_err(|e| format!("Unexpected pactl output {:?}: {e}", stdout.trim()))?;
+        let module_index: u32 = match stdout.trim().parse() {
+            Ok(module_index) => module_index,
+            Err(error) => {
+                let removed = unload_stale_modules(&self.source_name).await;
+                return Err(format!(
+                    "Unexpected pactl output {:?}: {error}; rolled back {removed} matching module(s)",
+                    stdout.trim()
+                ));
+            }
+        };
 
         info!("module-pipe-source loaded (index {module_index})");
         debug!(module_index, source_name = %self.source_name, "Virtual microphone is ready");
@@ -213,27 +214,20 @@ impl VirtualMic {
     }
 
     pub async fn unload(&self) -> Result<(), String> {
-        let module_index = {
-            let mut state = self.state.lock().await;
-            match std::mem::replace(&mut *state, VirtualMicState::Unloaded) {
-                VirtualMicState::Loaded { module_index } => module_index,
-                VirtualMicState::Unloaded => {
-                    info!("Virtual microphone already unloaded");
-                    return Ok(());
-                }
+        let mut state = self.state.lock().await;
+        let module_index = match *state {
+            VirtualMicState::Loaded { module_index } => module_index,
+            VirtualMicState::Unloaded => {
+                info!("Virtual microphone already unloaded");
+                return Ok(());
             }
         };
 
         info!("Unloading module-pipe-source (index {module_index})");
 
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("pactl")
-                .args(["unload-module", &module_index.to_string()])
-                .output()
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking panicked: {e}"))?
-        .map_err(|e| format!("Failed to execute pactl: {e}"))?;
+        let mut command = Command::new("pactl");
+        command.args(["unload-module", &module_index.to_string()]);
+        let output = run_pactl(command, "unload-module").await?;
 
         let unload_error = if output.status.success() {
             None
@@ -244,11 +238,11 @@ impl VirtualMic {
         };
 
         if let Some(stderr) = unload_error {
-            let mut state = self.state.lock().await;
-            *state = VirtualMicState::Loaded { module_index };
             return Err(format!("Failed to unload module-pipe-source: {stderr}"));
         }
 
+        *state = VirtualMicState::Unloaded;
+        drop(state);
         self.remove_pipe_file().await;
         info!("Virtual microphone unloaded");
         Ok(())
@@ -271,46 +265,57 @@ impl VirtualMic {
 }
 
 async fn unload_stale_modules(source_name: &str) -> usize {
-    let source_name = source_name.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let output = match std::process::Command::new("pactl")
-            .args(["list", "short", "modules"])
-            .output()
-        {
-            Ok(output) if output.status.success() => output,
-            _ => return 0,
-        };
-        let mut unloaded = 0;
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if !is_pipe_source_for(line, &source_name) {
-                continue;
-            }
-            let Some(index) = line.split_whitespace().next() else {
-                continue;
-            };
-            match std::process::Command::new("pactl")
-                .args(["unload-module", index])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    warn!(
-                        module_index = %index,
-                        "Unloaded stale module-pipe-source left by a previous run"
-                    );
-                    unloaded += 1;
-                }
-                Ok(output) => warn!(
-                    module_index = %index,
-                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                    "Could not unload stale module-pipe-source"
-                ),
-                Err(error) => warn!(%error, "Could not execute pactl unload-module"),
-            }
+    let mut list_command = Command::new("pactl");
+    list_command.args(["list", "short", "modules"]);
+    let output = match run_pactl(list_command, "list modules").await {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            warn!(
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "Could not list stale module-pipe-source modules"
+            );
+            return 0;
         }
-        unloaded
-    })
-    .await
-    .unwrap_or(0)
+        Err(error) => {
+            warn!(%error, "Could not list stale module-pipe-source modules");
+            return 0;
+        }
+    };
+    let mut unloaded = 0;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if !is_pipe_source_for(line, source_name) {
+            continue;
+        }
+        let Some(index) = line.split_whitespace().next() else {
+            continue;
+        };
+        let mut unload_command = Command::new("pactl");
+        unload_command.args(["unload-module", index]);
+        match run_pactl(unload_command, "unload stale module").await {
+            Ok(output) if output.status.success() => {
+                warn!(
+                    module_index = %index,
+                    "Unloaded stale module-pipe-source left by a previous run"
+                );
+                unloaded += 1;
+            }
+            Ok(output) => warn!(
+                module_index = %index,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "Could not unload stale module-pipe-source"
+            ),
+            Err(error) => warn!(%error, "Could not execute pactl unload-module"),
+        }
+    }
+    unloaded
+}
+
+async fn run_pactl(mut command: Command, action: &str) -> Result<std::process::Output, String> {
+    command.kill_on_drop(true);
+    tokio::time::timeout(PACTL_COMMAND_TIMEOUT, command.output())
+        .await
+        .map_err(|_| format!("pactl {action} timed out"))?
+        .map_err(|error| format!("Failed to execute pactl {action}: {error}"))
 }
 
 fn is_pipe_source_for(line: &str, source_name: &str) -> bool {

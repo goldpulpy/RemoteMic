@@ -11,6 +11,7 @@ use tracing::info;
 
 const CA_CERT_FILE: &str = "remotemic-ca.crt";
 const CA_KEY_FILE: &str = "remotemic-ca.key";
+const CA_TRANSACTION_FILE: &str = ".remotemic-ca-creating";
 
 pub fn certificate_directory() -> Result<PathBuf, String> {
     if let Some(directory) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
@@ -116,6 +117,7 @@ fn ensure_private_directory(directory: &Path) -> Result<(), String> {
 }
 
 fn load_or_create_ca(cert_path: &Path, key_path: &Path) -> Result<(String, String), String> {
+    recover_interrupted_ca_creation(cert_path, key_path)?;
     let cert = read_optional(cert_path)?;
     let key = read_optional(key_path)?;
     match (cert, key) {
@@ -163,10 +165,57 @@ fn create_ca(cert_path: &Path, key_path: &Path) -> Result<(String, String), Stri
     let cert_pem = cert.pem();
     let key_pem = key.serialize_pem();
 
-    write_private(cert_path, cert_pem.as_bytes())?;
-    write_private(key_path, key_pem.as_bytes())?;
+    let directory = cert_path
+        .parent()
+        .ok_or_else(|| format!("CA path {} has no parent directory", cert_path.display()))?;
+    let transaction_path = directory.join(CA_TRANSACTION_FILE);
+    write_private(&transaction_path, b"creating local CA\n")?;
+
+    let result = (|| -> Result<(), String> {
+        write_private(key_path, key_pem.as_bytes())?;
+        write_private(cert_path, cert_pem.as_bytes())?;
+        sync_directory(directory)?;
+        std::fs::remove_file(&transaction_path).map_err(|error| {
+            format!(
+                "Could not finish local CA transaction {}: {error}",
+                transaction_path.display()
+            )
+        })?;
+        sync_directory(directory)
+    })();
+    result?;
     info!(ca = %cert_path.display(), "Created persistent RemoteMic local CA");
     Ok((cert_pem, key_pem))
+}
+
+fn recover_interrupted_ca_creation(cert_path: &Path, key_path: &Path) -> Result<(), String> {
+    let Some(directory) = cert_path.parent() else {
+        return Ok(());
+    };
+    let transaction_path = directory.join(CA_TRANSACTION_FILE);
+    if !transaction_path.exists() {
+        return Ok(());
+    }
+
+    for path in [cert_path, key_path, transaction_path.as_path()] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not recover interrupted local CA creation at {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    sync_directory(directory)
+}
+
+fn sync_directory(directory: &Path) -> Result<(), String> {
+    std::fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("Could not synchronize {}: {error}", directory.display()))
 }
 
 fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -202,7 +251,7 @@ fn pem_certificate_to_der(pem: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{certificate_directory_from, load_or_create_ca, prepare};
+    use super::{CA_TRANSACTION_FILE, certificate_directory_from, load_or_create_ca, prepare};
     use std::ffi::OsStr;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -256,5 +305,24 @@ mod tests {
     #[test]
     fn certificate_directory_is_unavailable_without_home() {
         assert_eq!(certificate_directory_from(None), None);
+    }
+
+    #[test]
+    fn load_or_create_ca_recovers_an_interrupted_initial_creation() {
+        let directory = std::env::temp_dir().join(format!(
+            "remotemic-tls-recovery-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let cert_path = directory.join("remotemic-ca.crt");
+        let key_path = directory.join("remotemic-ca.key");
+        std::fs::write(&key_path, b"incomplete key").unwrap();
+        std::fs::write(directory.join(CA_TRANSACTION_FILE), b"creating").unwrap();
+
+        let result = load_or_create_ca(&cert_path, &key_path);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert!(result.is_ok(), "unexpected recovery error: {result:?}");
     }
 }
