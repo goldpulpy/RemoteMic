@@ -574,6 +574,7 @@ pub const HTML: &str = r#"
       const BYTES_PER_SAMPLE = __REMOTEMIC_BYTES_PER_SAMPLE__;
       const BUFFER_SIZE = SAMPLE_RATE <= 16000 ? 1024 : 4096;
       const MAX_BUFFERED_BYTES = BUFFER_SIZE * BYTES_PER_SAMPLE * 4;
+      const HEARTBEAT_INTERVAL_MS = 10000;
       const METER_FLOOR_DB = -55;
       const METER_CEILING_DB = -12;
       const TOKEN = "__REMOTEMIC_TOKEN__";
@@ -973,6 +974,7 @@ pub const HTML: &str = r#"
         session.audioCtx?.close().catch(() => {});
         session.wakeLock?.release().catch(() => {});
         if (session.connectTimer) clearTimeout(session.connectTimer);
+        if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
         if (session.droppedFrames > 0)
           console.warn(
             `Dropped ${session.droppedFrames} audio frames to avoid latency`,
@@ -1025,6 +1027,7 @@ pub const HTML: &str = r#"
           droppedFrames: 0,
           errorMessage: null,
           connectTimer: null,
+          heartbeatTimer: null,
         };
         currentSession = session;
 
@@ -1055,7 +1058,9 @@ pub const HTML: &str = r#"
             if (typeof data !== "string" || !isCurrent(session)) return;
             console.info("Server:", data);
             if (data.startsWith("error:")) {
-              session.errorMessage = "Another device is already connected";
+              session.errorMessage = data.includes("another client")
+                ? "Another device is already connected"
+                : "Computer rejected the audio stream";
               setStatus(session.errorMessage, "error");
               socket.close();
               return;
@@ -1065,6 +1070,13 @@ pub const HTML: &str = r#"
             session.accepted = true;
             clearTimeout(session.connectTimer);
             session.connectTimer = null;
+            session.heartbeatTimer = setInterval(() => {
+              if (
+                isCurrent(session) &&
+                socket.readyState === WebSocket.OPEN
+              )
+                socket.send("heartbeat");
+            }, HEARTBEAT_INTERVAL_MS);
             try {
               await startAudio(session);
               if (!isCurrent(session)) return;

@@ -149,7 +149,7 @@ the page asks the user to keep the screen awake manually.
 Download the latest binary:
 
 ```bash
-curl -L https://github.com/goldpulpy/RemoteMic/releases/latest/download/remotemic -o remotemic
+curl -L https://github.com/goldpulpy/RemoteMic/releases/download/latest/remotemic -o remotemic
 chmod +x remotemic
 sudo mv remotemic /usr/local/bin/remotemic
 ```
@@ -157,7 +157,7 @@ sudo mv remotemic /usr/local/bin/remotemic
 With `wget`:
 
 ```bash
-wget https://github.com/goldpulpy/RemoteMic/releases/latest/download/remotemic
+wget https://github.com/goldpulpy/RemoteMic/releases/download/latest/remotemic
 chmod +x remotemic
 sudo mv remotemic /usr/local/bin/remotemic
 ```

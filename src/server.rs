@@ -22,6 +22,46 @@ use crate::{audio::AudioConfig, page};
 const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 const ACQUIRE_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
 const ACQUIRE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const FIRST_AUDIO_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct SessionTimeouts {
+    first_audio_deadline: tokio::time::Instant,
+    received_audio: bool,
+}
+
+impl SessionTimeouts {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            first_audio_deadline: now + FIRST_AUDIO_FRAME_TIMEOUT,
+            received_audio: false,
+        }
+    }
+
+    fn receive_deadline(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        if self.received_audio {
+            now + SESSION_IDLE_TIMEOUT
+        } else {
+            self.first_audio_deadline
+        }
+    }
+
+    fn record_audio(&mut self) {
+        self.received_audio = true;
+    }
+
+    const fn reason(&self) -> &'static str {
+        if self.received_audio {
+            "client stopped sending heartbeats and audio"
+        } else {
+            "client did not start sending audio"
+        }
+    }
+}
+
+fn is_valid_audio_frame_len(frame_len: usize, bytes_per_sample: usize) -> bool {
+    bytes_per_sample > 0 && frame_len > 0 && frame_len.is_multiple_of(bytes_per_sample)
+}
 
 #[derive(Clone)]
 pub struct Server {
@@ -197,16 +237,45 @@ async fn handle_socket(socket: WebSocket, state: Server) {
     info!("Client connected (session {session_id})");
     let _ = sender.send(Message::Text("ok: connected".into())).await;
 
-    drop(sender);
-
     let audio_tx = state.audio_tx.clone();
+    let bytes_per_sample = state.audio_config.sample_format.bytes_per_sample();
     let mut dropped_frames = 0_u64;
     let mut received_frames = 0_u64;
     let mut received_bytes = 0_u64;
+    let mut timeouts = SessionTimeouts::new(tokio::time::Instant::now());
 
-    while let Some(msg) = receiver.next().await {
+    loop {
+        let deadline = timeouts.receive_deadline(tokio::time::Instant::now());
+        let msg = match tokio::time::timeout_at(deadline, receiver.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break,
+            Err(_) => {
+                warn!(
+                    session_id,
+                    reason = timeouts.reason(),
+                    "Audio session timed out"
+                );
+                break;
+            }
+        };
+
         match msg {
             Ok(Message::Binary(data)) => {
+                if !is_valid_audio_frame_len(data.len(), bytes_per_sample) {
+                    warn!(
+                        session_id,
+                        bytes = data.len(),
+                        bytes_per_sample,
+                        "Rejecting malformed audio frame"
+                    );
+                    let _ = sender
+                        .send(Message::Text("error: invalid audio frame".into()))
+                        .await;
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
+
+                timeouts.record_audio();
                 received_frames += 1;
                 received_bytes += data.len() as u64;
                 trace!(
@@ -257,7 +326,10 @@ async fn handle_socket(socket: WebSocket, state: Server) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionRegistry, render_page};
+    use super::{
+        FIRST_AUDIO_FRAME_TIMEOUT, SESSION_IDLE_TIMEOUT, SessionRegistry, SessionTimeouts,
+        is_valid_audio_frame_len, render_page,
+    };
     use crate::audio::AudioConfig;
 
     #[tokio::test]
@@ -271,6 +343,40 @@ mod tests {
 
         assert!(sessions.is_active(second));
         assert!(sessions.acquire().await.is_none());
+    }
+
+    #[test]
+    fn heartbeats_do_not_extend_first_audio_deadline() {
+        let start = tokio::time::Instant::now();
+        let timeouts = SessionTimeouts::new(start);
+
+        assert_eq!(
+            timeouts.receive_deadline(start + SESSION_IDLE_TIMEOUT),
+            start + FIRST_AUDIO_FRAME_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn activity_extends_streaming_session_deadline_after_first_audio() {
+        let start = tokio::time::Instant::now();
+        let mut timeouts = SessionTimeouts::new(start);
+        timeouts.record_audio();
+        let activity = start + FIRST_AUDIO_FRAME_TIMEOUT;
+
+        assert_eq!(
+            timeouts.receive_deadline(activity),
+            activity + SESSION_IDLE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn audio_frame_length_requires_whole_nonempty_samples() {
+        assert!(is_valid_audio_frame_len(4_096, 2));
+        assert!(is_valid_audio_frame_len(16_384, 4));
+        assert!(!is_valid_audio_frame_len(0, 2));
+        assert!(!is_valid_audio_frame_len(3, 2));
+        assert!(!is_valid_audio_frame_len(6, 4));
+        assert!(!is_valid_audio_frame_len(4, 0));
     }
 
     #[test]
@@ -307,5 +413,14 @@ mod tests {
         let html = render_page("test-token", AudioConfig::LOW);
 
         assert!(html.contains("return new AudioContextClass();"));
+    }
+
+    #[test]
+    fn page_sends_session_heartbeats() {
+        let html = render_page("test-token", AudioConfig::STANDARD);
+
+        assert!(html.contains("const HEARTBEAT_INTERVAL_MS = 10000;"));
+        assert!(html.contains("socket.send(\"heartbeat\");"));
+        assert!(html.contains("clearInterval(session.heartbeatTimer);"));
     }
 }

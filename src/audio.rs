@@ -1,10 +1,11 @@
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 const PIPE_FILE_NAME: &str = "remotemic.pipe";
+const LOCK_FILE_NAME: &str = "remotemic.lock";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SampleFormat {
@@ -71,6 +72,53 @@ pub struct VirtualMic {
     pipe_path: PathBuf,
     config: AudioConfig,
     source_name: Arc<str>,
+}
+
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    pub fn acquire() -> Result<Self, String> {
+        let uid = current_uid()?;
+        let dir = pipe_dir(uid);
+        ensure_private_directory(&dir, uid)
+            .map_err(|e| format!("Unsafe runtime directory {}: {e}", dir.display()))?;
+
+        let path = dir.join(LOCK_FILE_NAME);
+        debug!(lock_path = %path.display(), "Acquiring RemoteMic instance lock");
+        Self::acquire_at(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "RemoteMic is already running for this user".to_string()
+            } else {
+                format!(
+                    "Could not acquire instance lock {}: {error}",
+                    path.display()
+                )
+            }
+        })
+    }
+
+    fn acquire_at(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "another RemoteMic instance holds the lock",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+
+        Ok(Self { _file: file })
+    }
 }
 
 #[derive(Default)]
@@ -229,15 +277,19 @@ impl VirtualMic {
 }
 
 fn default_pipe_path() -> Result<PathBuf, String> {
-    let uid = std::fs::metadata("/proc/self")
-        .map_err(|e| format!("Could not determine the current user: {e}"))?
-        .uid();
+    let uid = current_uid()?;
     let dir = pipe_dir(uid);
 
     ensure_private_directory(&dir, uid)
         .map_err(|e| format!("Unsafe pipe directory {}: {e}", dir.display()))?;
 
     Ok(dir.join(PIPE_FILE_NAME))
+}
+
+fn current_uid() -> Result<u32, String> {
+    std::fs::metadata("/proc/self")
+        .map_err(|e| format!("Could not determine the current user: {e}"))
+        .map(|metadata| metadata.uid())
 }
 
 fn ensure_private_directory(dir: &Path, uid: u32) -> std::io::Result<()> {
@@ -283,7 +335,7 @@ fn pipe_dir(uid: u32) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_private_directory;
+    use super::{InstanceLock, ensure_private_directory};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn unique_test_path(name: &str) -> std::path::PathBuf {
@@ -331,5 +383,27 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn instance_lock_rejects_a_second_holder_and_recovers_after_drop() {
+        let dir = unique_test_path("instance-lock");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("remotemic.lock");
+
+        let first = InstanceLock::acquire_at(&path).unwrap();
+        let second = InstanceLock::acquire_at(&path);
+        assert_eq!(
+            second.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+
+        drop(first);
+        let third = InstanceLock::acquire_at(&path);
+        assert!(third.is_ok(), "lock was not released: {third:?}");
+
+        drop(third);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 }

@@ -7,8 +7,19 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/CI.yaml"
 
 jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --all-features --locked
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -28,7 +39,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   audit:
     name: security audit

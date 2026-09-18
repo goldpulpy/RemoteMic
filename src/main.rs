@@ -3,7 +3,7 @@ mod page;
 mod preflight;
 mod server;
 
-use audio::{AudioConfig, VirtualMic};
+use audio::{AudioConfig, InstanceLock, VirtualMic};
 use server::{AudioFrame, Server, SessionRegistry};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -42,6 +42,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
     debug!(?options, "Command-line options parsed");
+
+    let _instance_lock = match InstanceLock::acquire() {
+        Ok(lock) => lock,
+        Err(message) => {
+            error!("{message}");
+            std::process::exit(1);
+        }
+    };
     debug!("Running startup checks");
 
     if let Err(msg) = preflight::check_pactl().await {
@@ -62,7 +70,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let virtual_mic = VirtualMic::new(audio_config, options.source_name.clone())?;
     virtual_mic.load().await?;
 
-    let pipe_path = virtual_mic.pipe_path();
+    let service_result = run_service(&options, audio_config, virtual_mic.pipe_path()).await;
+
+    info!("Shutting down…");
+    debug!("Unloading virtual microphone");
+    let unload_result = virtual_mic.unload().await;
+
+    match (service_result, unload_result) {
+        (Ok(()), Ok(())) => {
+            info!("RemoteMic stopped");
+            Ok(())
+        }
+        (Err(service_error), Ok(())) => Err(service_error),
+        (Ok(()), Err(unload_error)) => {
+            error!("{unload_error}");
+            Err(std::io::Error::other(unload_error).into())
+        }
+        (Err(service_error), Err(unload_error)) => {
+            error!("Failed to unload virtual microphone after server error: {unload_error}");
+            Err(service_error)
+        }
+    }
+}
+
+async fn run_service(
+    options: &Options,
+    audio_config: AudioConfig,
+    pipe_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(options.queue_size);
 
     let listener = bind_listener(options.bind, options.port).await?;
@@ -81,11 +116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = server.router();
 
     debug!("HTTP and WebSocket router ready; entering server loop");
-    axum::serve(listener, app)
+    let server_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
 
-    info!("Shutting down…");
     debug!("Stopping audio writer task");
     writer.abort();
     match writer.await {
@@ -94,13 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => warn!(%error, "Audio writer task failed"),
     }
 
-    debug!("Unloading virtual microphone");
-    if let Err(e) = virtual_mic.unload().await {
-        error!("{e}");
-    }
-
-    info!("RemoteMic stopped");
-    Ok(())
+    server_result.map_err(Box::<dyn std::error::Error>::from)
 }
 
 // ---------------------------------------------------------------------------
