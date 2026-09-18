@@ -58,8 +58,13 @@ jobs:
 
       - name: Check installer
         run: |
-          shellcheck scripts/install.sh
+          shellcheck scripts/install.sh scripts/test-install.sh
           sh scripts/install.sh --yes --dependencies-only
+          if sh scripts/install.sh --dependencies-only --autostart; then
+            echo "Conflicting installer options were accepted" >&2
+            exit 1
+          fi
+          sh scripts/test-install.sh
 
   build-release:
     name: Build and publish Linux x86_64

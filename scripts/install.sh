@@ -10,6 +10,7 @@ INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 ASSUME_YES="false"
 SKIP_DEPENDENCIES="false"
 DEPENDENCIES_ONLY="false"
+AUTOSTART="false"
 
 usage() {
     cat <<'EOF'
@@ -25,6 +26,7 @@ Arguments:
   -y, --yes            Install missing system dependencies without asking
   --skip-dependencies  Do not check or install system dependencies
   --dependencies-only  Check/install dependencies without downloading RemoteMic
+  --autostart          Enable startup with systemd, OpenRC, or runit
   -h, --help           Show this help
 
 The INSTALL_DIR environment variable can also set the destination directory.
@@ -64,6 +66,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --dependencies-only)
             DEPENDENCIES_ONLY="true"
+            shift
+            ;;
+        --autostart)
+            AUTOSTART="true"
             shift
             ;;
         -h|--help)
@@ -159,7 +165,7 @@ run_as_root() {
     elif command -v sudo >/dev/null 2>&1; then
         sudo "$@"
     else
-        echo "Installing dependencies requires root privileges or sudo" >&2
+        echo "This operation requires root privileges or sudo" >&2
         return 1
     fi
 }
@@ -281,6 +287,17 @@ if [ "${SKIP_DEPENDENCIES}" = "true" ] && [ "${DEPENDENCIES_ONLY}" = "true" ]; t
     exit 2
 fi
 
+if [ "${DEPENDENCIES_ONLY}" = "true" ] && [ "${AUTOSTART}" = "true" ]; then
+    echo "--dependencies-only and --autostart cannot be used together" >&2
+    exit 2
+fi
+
+if [ "${AUTOSTART}" = "true" ] && [ "$(id -u)" -eq 0 ]; then
+    echo "Run the installer without sudo when using --autostart." >&2
+    echo "It will request sudo only when enabling boot-time startup." >&2
+    exit 1
+fi
+
 if [ "${SKIP_DEPENDENCIES}" = "false" ]; then
     ensure_dependencies
 fi
@@ -320,6 +337,248 @@ mkdir -p "${INSTALL_DIR}"
 install -m 0755 "${TEMP_DIR}/${ASSET}" "${INSTALL_DIR}/remotemic"
 
 echo "Installed RemoteMic to ${INSTALL_DIR}/remotemic"
+
+enable_systemd_autostart() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+    service_dir="${config_home}/systemd/user"
+    service_file="${service_dir}/remotemic.service"
+    generated_service="${TEMP_DIR}/remotemic.service"
+    binary_path="${INSTALL_DIR}/remotemic"
+    escaped_binary_path="$(
+        printf '%s' "${binary_path}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'
+    )"
+
+    if ! mkdir -p "${service_dir}"; then
+        return 1
+    fi
+    if ! cat >"${generated_service}" <<EOF
+[Unit]
+Description=RemoteMic virtual microphone
+Documentation=https://github.com/${REPOSITORY}
+After=pipewire-pulse.service pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart="${escaped_binary_path}"
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target
+EOF
+    then
+        echo "WARNING: Could not generate the systemd unit; autostart was skipped." >&2
+        return 1
+    fi
+
+    if [ -f "${service_file}" ] && ! cmp -s "${generated_service}" "${service_file}"; then
+        backup_file="${service_file}.backup.$(date +%Y%m%d%H%M%S)"
+        if ! cp -p "${service_file}" "${backup_file}"; then
+            echo "WARNING: Could not back up the existing service; it was not replaced." >&2
+            return 1
+        fi
+        echo "Backed up the existing service to ${backup_file}"
+    fi
+    if ! install -m 0644 "${generated_service}" "${service_file}"; then
+        echo "WARNING: Could not install the systemd unit; autostart was skipped." >&2
+        return 1
+    fi
+
+    if ! systemctl --user daemon-reload; then
+        echo "WARNING: The systemd user session is unavailable." >&2
+        return 1
+    fi
+    if ! systemctl --user enable remotemic.service; then
+        echo "WARNING: Could not enable remotemic.service; the binary is still installed." >&2
+        return 1
+    fi
+    if ! systemctl --user restart remotemic.service; then
+        echo "WARNING: remotemic.service is enabled but could not be started now." >&2
+        echo "Inspect it with: systemctl --user status remotemic.service" >&2
+    fi
+
+    if ! command -v loginctl >/dev/null 2>&1; then
+        echo "WARNING: loginctl was not found; the service will start only after login." >&2
+    elif ! run_as_root loginctl enable-linger "$(id -un)"; then
+        echo "WARNING: Could not enable linger; the service will start only after login." >&2
+    fi
+
+    echo "Enabled RemoteMic autostart at ${service_file}"
+    echo "View logs with: journalctl --user -u remotemic.service -b"
+    return 0
+}
+
+enable_openrc_autostart() {
+    if ! command -v rc-service >/dev/null 2>&1 \
+        || ! command -v rc-update >/dev/null 2>&1 \
+        || [ ! -x /sbin/openrc-run ]; then
+        return 1
+    fi
+
+    service_file="/etc/init.d/remotemic"
+    generated_service="${TEMP_DIR}/remotemic.openrc"
+    binary_path="${INSTALL_DIR}/remotemic"
+    service_user="$(id -un)"
+    service_group="$(id -gn)"
+    service_uid="$(id -u)"
+    escaped_binary_path="$(printf '%s' "${binary_path}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
+    escaped_home="$(printf '%s' "${HOME}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
+
+    if ! cat >"${generated_service}" <<EOF
+#!/sbin/openrc-run
+
+name="RemoteMic"
+description="RemoteMic virtual microphone"
+command="${escaped_binary_path}"
+command_user="${service_user}:${service_group}"
+directory="${escaped_home}"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/remotemic.log"
+error_log="/var/log/remotemic.log"
+export HOME="${escaped_home}"
+export XDG_RUNTIME_DIR="/run/user/${service_uid}"
+
+depend() {
+    need net
+    after pulseaudio pipewire pipewire-pulse
+}
+EOF
+    then
+        return 1
+    fi
+
+    if [ -f "${service_file}" ]; then
+        backup_file="${service_file}.backup.$(date +%Y%m%d%H%M%S)"
+        if ! run_as_root cp -p "${service_file}" "${backup_file}"; then
+            echo "WARNING: Could not back up the existing OpenRC service." >&2
+            return 1
+        fi
+        echo "Backed up the existing service to ${backup_file}"
+    fi
+    if ! run_as_root install -m 0755 "${generated_service}" "${service_file}"; then
+        return 1
+    fi
+    if ! run_as_root rc-update add remotemic default; then
+        return 1
+    fi
+    if ! run_as_root rc-service remotemic restart; then
+        if ! run_as_root rc-service remotemic start; then
+            echo "WARNING: The OpenRC service is enabled but could not be started now." >&2
+        fi
+    fi
+
+    echo "Enabled RemoteMic autostart with OpenRC at ${service_file}"
+    echo "View logs with: tail -f /var/log/remotemic.log"
+    return 0
+}
+
+enable_runit_autostart() {
+    if ! command -v sv >/dev/null 2>&1 || ! command -v chpst >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if [ -d /var/service ]; then
+        active_services="/var/service"
+    elif [ -d /service ]; then
+        active_services="/service"
+    elif [ -d /etc/runit/runsvdir/default ]; then
+        active_services="/etc/runit/runsvdir/default"
+    else
+        return 1
+    fi
+
+    service_dir="/etc/sv/remotemic"
+    generated_run="${TEMP_DIR}/remotemic-runit-run"
+    generated_log_run="${TEMP_DIR}/remotemic-runit-log-run"
+    binary_path="${INSTALL_DIR}/remotemic"
+    service_user="$(id -un)"
+    service_group="$(id -gn)"
+    service_uid="$(id -u)"
+    escaped_binary_path="$(printf '%s' "${binary_path}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
+    escaped_home="$(printf '%s' "${HOME}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
+
+    if ! cat >"${generated_run}" <<EOF
+#!/bin/sh
+exec 2>&1
+export HOME="${escaped_home}"
+export XDG_RUNTIME_DIR="/run/user/${service_uid}"
+cd "${escaped_home}"
+exec chpst -u "${service_user}:${service_group}" "${escaped_binary_path}"
+EOF
+    then
+        return 1
+    fi
+
+    if ! run_as_root mkdir -p "${service_dir}/log" /var/log/remotemic; then
+        return 1
+    fi
+    if [ -f "${service_dir}/run" ]; then
+        backup_file="${service_dir}/run.backup.$(date +%Y%m%d%H%M%S)"
+        if ! run_as_root cp -p "${service_dir}/run" "${backup_file}"; then
+            echo "WARNING: Could not back up the existing runit service." >&2
+            return 1
+        fi
+        echo "Backed up the existing service to ${backup_file}"
+    fi
+    if ! run_as_root install -m 0755 "${generated_run}" "${service_dir}/run"; then
+        return 1
+    fi
+
+    if command -v svlogd >/dev/null 2>&1; then
+        if ! cat >"${generated_log_run}" <<'EOF'
+#!/bin/sh
+exec svlogd -tt /var/log/remotemic
+EOF
+        then
+            return 1
+        fi
+        if ! run_as_root install -m 0755 "${generated_log_run}" "${service_dir}/log/run"; then
+            return 1
+        fi
+    fi
+
+    if ! run_as_root ln -sfn "${service_dir}" "${active_services}/remotemic"; then
+        return 1
+    fi
+    if ! run_as_root sv up "${active_services}/remotemic"; then
+        echo "WARNING: The runit service is enabled but could not be started now." >&2
+    fi
+
+    echo "Enabled RemoteMic autostart with runit at ${service_dir}"
+    if command -v svlogd >/dev/null 2>&1; then
+        echo "View logs with: tail -f /var/log/remotemic/current"
+    fi
+    return 0
+}
+
+enable_autostart() {
+    if enable_systemd_autostart; then
+        return 0
+    fi
+    if enable_openrc_autostart; then
+        return 0
+    fi
+    if enable_runit_autostart; then
+        return 0
+    fi
+
+    echo "WARNING: No supported service manager could be configured." >&2
+    echo "RemoteMic was installed successfully without autostart." >&2
+    echo "Supported managers: systemd, OpenRC, and runit." >&2
+    return 0
+}
+
+if [ "${AUTOSTART}" = "true" ]; then
+    enable_autostart
+fi
+
 case ":${PATH}:" in
     *:"${INSTALL_DIR}":*) ;;
     *) echo "Add ${INSTALL_DIR} to PATH to run 'remotemic' from any directory." ;;

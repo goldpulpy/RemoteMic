@@ -75,6 +75,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Lint installer
-        run: shellcheck scripts/install.sh
+        run: shellcheck scripts/install.sh scripts/test-install.sh
       - name: Check installer dependencies
         run: sh scripts/install.sh --yes --dependencies-only
+      - name: Check installer argument validation
+        run: |
+          if sh scripts/install.sh --dependencies-only --autostart; then
+            echo "Conflicting installer options were accepted" >&2
+            exit 1
+          fi
+      - name: Check autostart fallback
+        run: sh scripts/test-install.sh

@@ -13,7 +13,7 @@
 
 [English](README.md) · [Русский](README.ru.md)
 
-[🚀 Quick start](#quick-start) · [🎚 Audio quality](#audio-quality) · [🛠 Installation](#installation) · [🔒 Security](#security-model) · [❓ Troubleshooting](#troubleshooting) · [📄 License](#license)
+[🚀 Quick start](#quick-start) · [🎚 Audio quality](#audio-quality) · [🛠 Installation](#installation) · [⚡ Autostart](#systemd-service) · [🔒 Security](#security-model) · [❓ Troubleshooting](#troubleshooting) · [📄 License](#license)
 
 </div>
 
@@ -237,6 +237,78 @@ then run:
 rustup target add x86_64-unknown-linux-musl
 make release
 ./target/x86_64-unknown-linux-musl/release/remotemic --help
+```
+
+</details>
+
+<a id="systemd-service"></a>
+
+## ⚡ Start automatically as a service
+
+<details>
+<summary><strong>Show automatic service setup and manual systemd setup</strong></summary>
+
+Run RemoteMic as a user service so it can access the same PulseAudio or
+PipeWire session as your desktop user. The installer can configure the service,
+start it, and enable boot-time startup automatically:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh -s -- --autostart
+```
+
+The installer detects systemd, OpenRC, and runit automatically. This covers the
+usual Fedora, Debian, Ubuntu, openSUSE, Arch, Alpine, Gentoo, Void, and related
+setups. If none can be configured, it prints a warning and keeps the successful
+RemoteMic installation instead of failing.
+
+For manual systemd setup, create
+`~/.config/systemd/user/remotemic.service` with the following contents:
+
+```ini
+[Unit]
+Description=RemoteMic virtual microphone
+Documentation=https://github.com/goldpulpy/RemoteMic
+After=pipewire-pulse.service pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/remotemic
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target
+```
+
+If RemoteMic was installed elsewhere, change `ExecStart`. Command-line options
+can be appended there, for example `--quality high --port 59152`.
+
+Enable the service and start it immediately:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now remotemic.service
+```
+
+The service now starts whenever this user logs in. To start it during system
+boot even before login, enable lingering once:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+Inspect its status and find the current access URL in the logs:
+
+```bash
+systemctl --user status remotemic.service
+journalctl --user -u remotemic.service -b
+```
+
+To disable autostart:
+
+```bash
+systemctl --user disable --now remotemic.service
 ```
 
 </details>
