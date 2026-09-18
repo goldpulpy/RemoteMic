@@ -149,6 +149,11 @@ impl VirtualMic {
             return Ok(());
         }
 
+        let removed = unload_stale_modules(&self.source_name).await;
+        if removed > 0 {
+            info!(removed, "Removed stale module-pipe-source modules");
+        }
+
         match tokio::fs::try_exists(&self.pipe_path).await {
             Ok(true) => {
                 warn!(
@@ -238,14 +243,13 @@ impl VirtualMic {
             Some(stderr)
         };
 
-        self.remove_pipe_file().await;
-
         if let Some(stderr) = unload_error {
             let mut state = self.state.lock().await;
             *state = VirtualMicState::Loaded { module_index };
             return Err(format!("Failed to unload module-pipe-source: {stderr}"));
         }
 
+        self.remove_pipe_file().await;
         info!("Virtual microphone unloaded");
         Ok(())
     }
@@ -264,6 +268,50 @@ impl VirtualMic {
             ),
         }
     }
+}
+
+async fn unload_stale_modules(source_name: &str) -> usize {
+    let source_name = source_name.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let output = match std::process::Command::new("pactl")
+            .args(["list", "short", "modules"])
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => return 0,
+        };
+        let marker = format!("source_name={source_name}");
+        let mut unloaded = 0;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if !line.contains("module-pipe-source") || !line.contains(&marker) {
+                continue;
+            }
+            let Some(index) = line.split_whitespace().next() else {
+                continue;
+            };
+            match std::process::Command::new("pactl")
+                .args(["unload-module", index])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    warn!(
+                        module_index = %index,
+                        "Unloaded stale module-pipe-source left by a previous run"
+                    );
+                    unloaded += 1;
+                }
+                Ok(output) => warn!(
+                    module_index = %index,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "Could not unload stale module-pipe-source"
+                ),
+                Err(error) => warn!(%error, "Could not execute pactl unload-module"),
+            }
+        }
+        unloaded
+    })
+    .await
+    .unwrap_or(0)
 }
 
 fn default_pipe_path() -> Result<PathBuf, String> {

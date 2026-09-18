@@ -13,6 +13,9 @@ const CA_CERT_FILE: &str = "remotemic-ca.crt";
 const CA_KEY_FILE: &str = "remotemic-ca.key";
 
 pub fn certificate_directory() -> Result<PathBuf, String> {
+    if let Some(directory) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(directory).join("remotemic"));
+    }
     certificate_directory_from(std::env::var_os("HOME").as_deref()).ok_or_else(|| {
         "Could not determine persistent certificate directory: HOME is unset".to_string()
     })
@@ -113,20 +116,35 @@ fn ensure_private_directory(directory: &Path) -> Result<(), String> {
 }
 
 fn load_or_create_ca(cert_path: &Path, key_path: &Path) -> Result<(String, String), String> {
-    match (
-        std::fs::read_to_string(cert_path),
-        std::fs::read_to_string(key_path),
-    ) {
-        (Ok(cert), Ok(key)) => return Ok((cert, key)),
-        (Err(error), _) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(format!("Could not read {}: {error}", cert_path.display()));
-        }
-        (_, Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(format!("Could not read {}: {error}", key_path.display()));
-        }
-        _ => {}
+    let cert = read_optional(cert_path)?;
+    let key = read_optional(key_path)?;
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok((cert, key)),
+        (None, None) => create_ca(cert_path, key_path),
+        (Some(_), None) => Err(format!(
+            "Local CA certificate {} exists but its private key {} is missing; \
+             remove the directory and reinstall the CA on every device",
+            cert_path.display(),
+            key_path.display()
+        )),
+        (None, Some(_)) => Err(format!(
+            "Local CA private key {} exists but its certificate {} is missing; \
+             remove the directory and reinstall the CA on every device",
+            key_path.display(),
+            cert_path.display()
+        )),
     }
+}
 
+fn read_optional(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
+}
+
+fn create_ca(cert_path: &Path, key_path: &Path) -> Result<(String, String), String> {
     let key =
         KeyPair::generate().map_err(|error| format!("Could not generate local CA key: {error}"))?;
     let mut params = CertificateParams::default();
@@ -152,13 +170,23 @@ fn load_or_create_ca(cert_path: &Path, key_path: &Path) -> Result<(String, Strin
 }
 
 fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
-    let mut file = options
-        .open(path)
-        .map_err(|error| format!("Could not create {}: {error}", path.display()))?;
-    std::io::Write::write_all(&mut file, data)
-        .map_err(|error| format!("Could not write {}: {error}", path.display()))
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut file = options.open(&temporary)?;
+        std::io::Write::write_all(&mut file, data)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|error| format!("Could not write {}: {error}", path.display()))
 }
 
 fn pem_certificate_to_der(pem: &str) -> Result<Vec<u8>, String> {
@@ -174,7 +202,7 @@ fn pem_certificate_to_der(pem: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{certificate_directory_from, prepare};
+    use super::{certificate_directory_from, load_or_create_ca, prepare};
     use std::ffi::OsStr;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -195,6 +223,24 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
 
         assert_eq!(first.ca_der, second.ca_der);
+    }
+
+    #[test]
+    fn load_or_create_ca_rejects_a_missing_private_key() {
+        let directory = std::env::temp_dir().join(format!(
+            "remotemic-tls-mismatch-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let cert_path = directory.join("remotemic-ca.crt");
+        let key_path = directory.join("remotemic-ca.key");
+        std::fs::write(&cert_path, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+
+        let result = load_or_create_ca(&cert_path, &key_path);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert!(result.is_err());
     }
 
     #[test]

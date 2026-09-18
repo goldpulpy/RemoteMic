@@ -7,7 +7,7 @@ mod tls;
 use audio::{AudioConfig, InstanceLock, VirtualMic};
 use nix::ifaddrs::getifaddrs;
 use nix::net::if_::InterfaceFlags;
-use server::{AudioFrameReceiver, Server, SessionRegistry, StreamMetrics, audio_frame_channel};
+use server::{AudioFrameReceiver, MetricsHub, Server, SessionRegistry, audio_frame_channel};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -351,7 +351,10 @@ fn global_ipv4_addresses() -> Vec<IpAddr> {
 
     let mut candidates: Vec<(u8, IpAddr)> = Vec::new();
     for interface in interfaces {
-        if !interface.flags.contains(InterfaceFlags::IFF_UP) {
+        if !interface
+            .flags
+            .contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING)
+        {
             continue;
         }
         let rank = interface_rank(&interface.interface_name);
@@ -429,13 +432,23 @@ fn advertised_address(address: IpAddr) -> Result<IpAddr, std::io::Error> {
     match address {
         IpAddr::V4(address) if address.is_unspecified() => {
             let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-            socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
-            Ok(socket.local_addr()?.ip())
+            match socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)) {
+                Ok(()) => Ok(socket.local_addr()?.ip()),
+                Err(error) => {
+                    warn!(%error, "No routable IPv4 address found; advertising localhost");
+                    Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                }
+            }
         }
         IpAddr::V6(address) if address.is_unspecified() => {
             let socket = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))?;
-            socket.connect((std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9))?;
-            Ok(socket.local_addr()?.ip())
+            match socket.connect((std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9)) {
+                Ok(()) => Ok(socket.local_addr()?.ip()),
+                Err(error) => {
+                    warn!(%error, "No routable IPv6 address found; advertising localhost");
+                    Ok(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+                }
+            }
         }
         address => Ok(address),
     }
@@ -452,17 +465,23 @@ async fn shutdown_signal() {
     use tokio::signal;
 
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
+        if let Err(error) = signal::ctrl_c().await {
+            error!(%error, "Failed to install Ctrl-C handler");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                error!(%error, "Failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -482,7 +501,7 @@ async fn audio_writer_loop(
     path: PathBuf,
     rx: AudioFrameReceiver,
     sessions: SessionRegistry,
-    metrics: StreamMetrics,
+    metrics: MetricsHub,
 ) {
     info!("Audio writer ready, waiting for data on {}", path.display());
     let mut stale_frames = 0_u64;
@@ -501,14 +520,16 @@ async fn audio_writer_loop(
         metrics.record_queue_delay(first.enqueued_at.elapsed());
 
         debug!(session_id = first.session_id, "Opening audio pipe");
-        let mut writer = match pipe::OpenOptions::new().read_write(true).open_sender(&path) {
+        let mut writer = match pipe::OpenOptions::new().open_sender(&path) {
             Ok(writer) => writer,
             Err(e) => {
-                error!("Failed to open pipe for writing: {e}");
+                // ENXIO/NotFound simply mean no reader is attached yet; retry on
+                // the next frame instead of stalling the writer indefinitely.
+                debug!("Audio pipe is not ready for writing: {e}");
                 let drained = rx.drain();
-                debug!(
+                trace!(
                     drained_frames = drained,
-                    "Drained audio queue after pipe error"
+                    "Drained audio queue while waiting for a pipe reader"
                 );
                 continue;
             }
@@ -570,7 +591,7 @@ where
     W: AsyncWrite + Unpin,
 {
     writer.write_all(data).await.map_err(|e| {
-        warn!("Pipe write error (client disconnected?): {e}");
+        warn!("Audio pipe write failed (reader closed?): {e}");
     })
 }
 

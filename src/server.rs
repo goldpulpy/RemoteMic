@@ -55,6 +55,9 @@ const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
 const ACQUIRE_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
 const ACQUIRE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SIGNALING_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const CONNECTION_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEC_LOOKUP_ATTEMPTS: usize = 25;
+const CODEC_LOOKUP_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_PLC_PACKETS: u16 = 3;
 const OPUS_CLOCK_RATE: u32 = 48_000;
 
@@ -65,7 +68,7 @@ pub struct Server {
     token: Arc<str>,
     audio_config: AudioConfig,
     ca_der: Arc<[u8]>,
-    metrics: StreamMetrics,
+    metrics: MetricsHub,
 }
 
 pub struct AudioFrame {
@@ -210,16 +213,6 @@ struct MetricsSnapshot {
 }
 
 impl StreamMetrics {
-    fn reset(&self) {
-        self.0.packets_received.store(0, Ordering::Relaxed);
-        self.0.packets_lost.store(0, Ordering::Relaxed);
-        self.0.packets_reordered.store(0, Ordering::Relaxed);
-        self.0.decoded_frames.store(0, Ordering::Relaxed);
-        self.0.dropped_frames.store(0, Ordering::Relaxed);
-        self.0.jitter_micros.store(0, Ordering::Relaxed);
-        self.0.queue_micros.store(0, Ordering::Relaxed);
-    }
-
     fn snapshot(&self) -> MetricsSnapshot {
         let received = self.0.packets_received.load(Ordering::Relaxed);
         let lost = self.0.packets_lost.load(Ordering::Relaxed);
@@ -248,6 +241,53 @@ impl StreamMetrics {
     }
 }
 
+/// Holds the metrics of the currently active session so that `/metrics` never
+/// mixes counters from a finished session with a new one.
+#[derive(Clone, Default)]
+pub struct MetricsHub(Arc<Mutex<Option<StreamMetrics>>>);
+
+impl MetricsHub {
+    fn install(&self, metrics: &StreamMetrics) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(metrics.clone());
+    }
+
+    fn clear(&self, metrics: &StreamMetrics) {
+        let mut current = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current
+            .as_ref()
+            .is_some_and(|value| Arc::ptr_eq(&value.0, &metrics.0))
+        {
+            *current = None;
+        }
+    }
+
+    pub fn record_queue_delay(&self, delay: Duration) {
+        if let Some(metrics) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            metrics.record_queue_delay(delay);
+        }
+    }
+
+    fn snapshot(&self) -> MetricsSnapshot {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(StreamMetrics::snapshot)
+            .unwrap_or_else(|| StreamMetrics::default().snapshot())
+    }
+}
+
 impl Server {
     pub fn new(audio_tx: AudioFrameSender, audio_config: AudioConfig, ca_der: Vec<u8>) -> Self {
         let token = format!(
@@ -261,14 +301,14 @@ impl Server {
             token: Arc::from(token),
             audio_config,
             ca_der: Arc::from(ca_der),
-            metrics: StreamMetrics::default(),
+            metrics: MetricsHub::default(),
         }
     }
 
     pub fn sessions(&self) -> SessionRegistry {
         self.sessions.clone()
     }
-    pub fn metrics(&self) -> StreamMetrics {
+    pub fn metrics(&self) -> MetricsHub {
         self.metrics.clone()
     }
 
@@ -282,8 +322,12 @@ impl Server {
     }
 }
 
-async fn index_handler(State(state): State<Server>) -> Html<String> {
-    Html(render_page(&state.token, state.audio_config))
+async fn index_handler(State(state): State<Server>) -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Html(render_page(&state.token, state.audio_config)),
+    )
+        .into_response()
 }
 
 async fn ca_handler(State(state): State<Server>) -> Response {
@@ -293,6 +337,7 @@ async fn ca_handler(State(state): State<Server>) -> Response {
             header::CONTENT_DISPOSITION,
             "attachment; filename=remotemic-ca.crt",
         )
+        .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(state.ca_der.to_vec()))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -334,13 +379,23 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Server>, uri: Uri)
                 .split('&')
                 .find_map(|pair| pair.strip_prefix("token="))
         })
-        .is_some_and(|token| token == state.token.as_ref());
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), state.token.as_bytes()));
     if !authorized {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
     ws.max_message_size(MAX_WS_MESSAGE_SIZE)
         .max_frame_size(MAX_WS_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
 }
 
 #[derive(Clone)]
@@ -350,7 +405,16 @@ struct WebRtcHandler {
     audio_config: AudioConfig,
     sessions: SessionRegistry,
     metrics: StreamMetrics,
+    metrics_hub: MetricsHub,
     gather_complete: Arc<Notify>,
+    connected: Arc<Notify>,
+}
+
+impl WebRtcHandler {
+    fn release(&self) {
+        self.sessions.release(self.session_id);
+        self.metrics_hub.clear(&self.metrics);
+    }
 }
 
 #[async_trait]
@@ -366,11 +430,17 @@ impl PeerConnectionEventHandler for WebRtcHandler {
         info!(session_id = self.session_id, %state, "WebRTC connection state changed");
         if matches!(
             state,
-            RTCPeerConnectionState::Failed
+            RTCPeerConnectionState::Connected
+                | RTCPeerConnectionState::Failed
                 | RTCPeerConnectionState::Closed
-                | RTCPeerConnectionState::Disconnected
         ) {
-            self.sessions.release(self.session_id);
+            self.connected.notify_one();
+        }
+        if matches!(
+            state,
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+        ) {
+            self.release();
         }
     }
 
@@ -382,10 +452,20 @@ impl PeerConnectionEventHandler for WebRtcHandler {
             );
             return;
         };
-        let is_opus = track
-            .codec(ssrc)
-            .await
-            .is_some_and(|codec| codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_OPUS));
+        let mut is_opus = false;
+        for attempt in 0..CODEC_LOOKUP_ATTEMPTS {
+            match track.codec(ssrc).await {
+                Some(codec) => {
+                    is_opus = codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_OPUS);
+                    break;
+                }
+                None => {
+                    if attempt + 1 < CODEC_LOOKUP_ATTEMPTS {
+                        tokio::time::sleep(CODEC_LOOKUP_INTERVAL).await;
+                    }
+                }
+            }
+        }
         if !is_opus {
             warn!(
                 session_id = self.session_id,
@@ -412,22 +492,26 @@ async fn handle_socket(socket: WebSocket, state: Server) {
             .await;
         return;
     };
-    state.metrics.reset();
     info!(session_id, "Signaling client connected");
+    let metrics = StreamMetrics::default();
+    state.metrics.install(&metrics);
     let gather_complete = Arc::new(Notify::new());
+    let connected = Arc::new(Notify::new());
     let handler = Arc::new(WebRtcHandler {
         session_id,
         audio_tx: state.audio_tx.clone(),
         audio_config: state.audio_config,
         sessions: state.sessions.clone(),
-        metrics: state.metrics.clone(),
+        metrics,
+        metrics_hub: state.metrics.clone(),
         gather_complete: Arc::clone(&gather_complete),
+        connected: Arc::clone(&connected),
     });
-    let peer = match create_peer_connection(handler).await {
+    let peer = match create_peer_connection(Arc::clone(&handler)).await {
         Ok(peer) => peer,
         Err(error) => {
             error!(session_id, %error, "Could not create WebRTC peer");
-            state.sessions.release(session_id);
+            handler.release();
             return;
         }
     };
@@ -437,18 +521,26 @@ async fn handle_socket(socket: WebSocket, state: Server) {
         Ok(Ok(offer)) => offer,
         Ok(Err(error)) => {
             send_error(&mut sender, &error).await;
-            close_peer(&peer, &state.sessions, session_id).await;
+            close_peer(&peer, &handler).await;
             return;
         }
         Err(_) => {
             send_error(&mut sender, "timed out waiting for WebRTC offer").await;
-            close_peer(&peer, &state.sessions, session_id).await;
+            close_peer(&peer, &handler).await;
             return;
         }
     };
     if let Err(error) = negotiate(&peer, offer, &gather_complete, &mut sender).await {
         send_error(&mut sender, &error).await;
-        close_peer(&peer, &state.sessions, session_id).await;
+        close_peer(&peer, &handler).await;
+        return;
+    }
+    if tokio::time::timeout(CONNECTION_ESTABLISH_TIMEOUT, connected.notified())
+        .await
+        .is_err()
+    {
+        send_error(&mut sender, "timed out establishing WebRTC connection").await;
+        close_peer(&peer, &handler).await;
         return;
     }
 
@@ -462,7 +554,7 @@ async fn handle_socket(socket: WebSocket, state: Server) {
             _ => {}
         }
     }
-    close_peer(&peer, &state.sessions, session_id).await;
+    close_peer(&peer, &handler).await;
     info!(session_id, "WebRTC session ended");
 }
 
@@ -558,11 +650,11 @@ async fn negotiate(
         .map_err(|error| error.to_string())
 }
 
-async fn close_peer(peer: &Arc<dyn PeerConnection>, sessions: &SessionRegistry, session_id: u64) {
+async fn close_peer(peer: &Arc<dyn PeerConnection>, handler: &WebRtcHandler) {
     if let Err(error) = peer.close().await {
-        debug!(session_id, %error, "WebRTC close failed");
+        debug!(session_id = handler.session_id, %error, "WebRTC close failed");
     }
-    sessions.release(session_id);
+    handler.release();
 }
 
 async fn send_error(
@@ -628,8 +720,15 @@ async fn receive_opus_track(
                 .packets_lost
                 .fetch_add(u64::from(missing), Ordering::Relaxed);
             if let Some(toc) = previous_toc {
+                // Force packet code 0 so opus-rs treats the single byte as a lost
+                // frame; other codes reject a one-byte packet before PLC runs.
+                let conceal_toc = concealment_toc(toc);
                 for _ in 0..missing.min(MAX_PLC_PACKETS) {
-                    decode_and_queue(&mut decoder, &[toc], &mut f32_buffer, &handler)?;
+                    if let Err(error) =
+                        decode_and_queue(&mut decoder, &[conceal_toc], &mut f32_buffer, &handler)
+                    {
+                        debug!(%error, "Opus packet-loss concealment failed");
+                    }
                 }
             }
         }
@@ -641,14 +740,29 @@ async fn receive_opus_track(
             );
             continue;
         }
+        if let Err(error) =
+            decode_and_queue(&mut decoder, &packet.payload, &mut f32_buffer, &handler)
+        {
+            warn!(
+                session_id = handler.session_id,
+                sequence_number = packet.header.sequence_number,
+                %error,
+                "Dropping undecodable Opus packet"
+            );
+            continue;
+        }
         previous_toc = packet.payload.first().copied();
-        decode_and_queue(&mut decoder, &packet.payload, &mut f32_buffer, &handler)?;
     }
     Ok(())
 }
 
 fn has_opus_payload(payload: &[u8]) -> bool {
     !payload.is_empty()
+}
+
+fn concealment_toc(toc: u8) -> u8 {
+    // Clear the two packet-code bits so opus-rs parses a single (lost) frame.
+    toc & 0xFC
 }
 
 fn decode_and_queue(
@@ -724,12 +838,38 @@ fn update_jitter(
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioFrame, SessionRegistry, StreamMetrics, audio_frame_channel, has_opus_payload,
-        render_page,
+        AudioFrame, MetricsHub, SessionRegistry, StreamMetrics, audio_frame_channel,
+        concealment_toc, constant_time_eq, has_opus_payload, render_page,
     };
     use crate::audio::AudioConfig;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_tokens() {
+        assert!(constant_time_eq(b"deadbeef", b"deadbeef"));
+        assert!(!constant_time_eq(b"deadbeef", b"deadbeee"));
+        assert!(!constant_time_eq(b"short", b"longer-token"));
+    }
+
+    #[test]
+    fn concealment_toc_forces_single_frame_code() {
+        // Config/stereo bits are preserved while the packet code becomes 0.
+        assert_eq!(concealment_toc(0b0000_0011), 0b0000_0000);
+        assert_eq!(concealment_toc(0b1101_0111), 0b1101_0100);
+    }
+
+    #[test]
+    fn metrics_hub_snapshot_tracks_installed_session() {
+        let hub = MetricsHub::default();
+        let metrics = StreamMetrics::default();
+        hub.install(&metrics);
+        metrics.0.packets_received.store(7, Ordering::Relaxed);
+        assert_eq!(hub.snapshot().packets_received, 7);
+
+        hub.clear(&metrics);
+        assert_eq!(hub.snapshot().packets_received, 0);
+    }
 
     #[tokio::test]
     async fn stale_release_cannot_clear_a_new_session() {

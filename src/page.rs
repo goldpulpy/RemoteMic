@@ -557,6 +557,13 @@ pub const HTML: &str = r#"
         lock the device while streaming.
       </div>
 
+      <div id="processing-warning" class="warn-box">
+        <strong>Microphone processing may be active</strong><br />
+        This browser did not apply all requested audio constraints, so echo
+        cancellation, noise suppression, or automatic gain control may still
+        alter the signal.
+      </div>
+
       <div class="bars" id="bars">
         <span></span><span></span><span></span><span></span><span></span>
         <span></span><span></span><span></span><span></span><span></span>
@@ -636,6 +643,7 @@ pub const HTML: &str = r#"
       const queueState = document.getElementById("queue-state");
       const httpsWarning = document.getElementById("https-warning");
       const wakeWarning = document.getElementById("wake-warning");
+      const processingWarning = document.getElementById("processing-warning");
       const bars = document.getElementById("bars");
       const barItems = [...bars.querySelectorAll("span")];
       const meterWrap = document.getElementById("meter-wrap");
@@ -678,6 +686,7 @@ pub const HTML: &str = r#"
             resolve();
           }
           peer.addEventListener("icegatheringstatechange", changed);
+          changed();
         });
       }
 
@@ -736,9 +745,13 @@ pub const HTML: &str = r#"
           return;
         }
         try {
-          activeSession.wakeLock = await navigator.wakeLock.request("screen");
+          const lock = await navigator.wakeLock.request("screen");
+          activeSession.wakeLock = lock;
           wakeState.textContent = "Kept awake";
-          activeSession.wakeLock.addEventListener("release", () => {
+          lock.addEventListener("release", () => {
+            if (activeSession.wakeLock === lock) {
+              activeSession.wakeLock = null;
+            }
             if (session === activeSession && !activeSession.stopping) {
               wakeState.textContent = "Released";
             }
@@ -839,7 +852,13 @@ pub const HTML: &str = r#"
 
         const AudioContextClass =
           window.AudioContext || window.webkitAudioContext;
-        const audioContext = new AudioContextClass({ sampleRate: 48000 });
+        let audioContext;
+        try {
+          audioContext = new AudioContextClass({ sampleRate: 48000 });
+        } catch (error) {
+          console.debug("Falling back to the default AudioContext rate", error);
+          audioContext = new AudioContextClass();
+        }
         await audioContext.resume();
         const source = audioContext.createMediaStreamSource(stream);
         const analyser = audioContext.createAnalyser();
@@ -871,6 +890,7 @@ pub const HTML: &str = r#"
           socket,
           wakeLock: null,
           metricsTimer: null,
+          answerTimer: null,
           animationFrame: null,
           stopping: false,
           muted: false,
@@ -882,6 +902,8 @@ pub const HTML: &str = r#"
           try {
             const message = JSON.parse(data);
             if (message.type === "answer") {
+              clearTimeout(activeSession.answerTimer);
+              activeSession.answerTimer = null;
               await peer.setRemoteDescription(message);
             } else if (message.type === "error") {
               stop(message.message, true);
@@ -898,6 +920,8 @@ pub const HTML: &str = r#"
         peer.addEventListener("connectionstatechange", () => {
           if (session !== activeSession) return;
           if (peer.connectionState === "connected") {
+            clearTimeout(activeSession.answerTimer);
+            activeSession.answerTimer = null;
             setBadge("Connected", "connected");
             streamState.textContent = "WebRTC · Opus · LAN";
             btn.disabled = false;
@@ -914,10 +938,22 @@ pub const HTML: &str = r#"
         await peer.setLocalDescription(offer);
         await waitForIceGathering(peer);
         socket.send(JSON.stringify(peer.localDescription));
+        activeSession.answerTimer = setTimeout(() => {
+          if (session === activeSession && !activeSession.stopping) {
+            stop("WebRTC answer timed out", true);
+          }
+        }, 15000);
 
         const settings = track.getSettings();
+        const processing = [];
+        if (settings.echoCancellation === true) processing.push("echo cancellation");
+        if (settings.noiseSuppression === true) processing.push("noise suppression");
+        if (settings.autoGainControl === true) processing.push("auto gain");
         micState.textContent =
-          (settings.sampleRate || 48000) + " Hz · mono · processing off";
+          (settings.sampleRate || 48000) +
+          " Hz · mono · " +
+          (processing.length ? processing.join(", ") + " on" : "processing off");
+        processingWarning.classList.toggle("visible", processing.length > 0);
         streamState.textContent = "Negotiating WebRTC";
         btn.textContent = "Disconnect";
         btn.classList.add("disconnect");
@@ -935,12 +971,18 @@ pub const HTML: &str = r#"
       async function stop(reason = "Ready", failed = false) {
         const activeSession = session;
         if (!activeSession) {
+          if (window.isSecureContext) {
+            btn.disabled = false;
+            btn.textContent = "Connect microphone";
+            btn.classList.remove("disconnect");
+          }
           setBadge(reason, failed ? "error" : "");
           return;
         }
         activeSession.stopping = true;
         session = null;
         clearInterval(activeSession.metricsTimer);
+        clearTimeout(activeSession.answerTimer);
         cancelAnimationFrame(activeSession.animationFrame);
         activeSession.stream.getTracks().forEach((track) => track.stop());
         activeSession.peer.close();
@@ -967,6 +1009,7 @@ pub const HTML: &str = r#"
         micState.textContent = "Off";
         streamState.textContent = "Not sending";
         wakeState.textContent = "Managed when connected";
+        processingWarning.classList.remove("visible");
         rttState.textContent = "-";
         networkState.textContent = "-";
         queueState.textContent = "-";

@@ -5,10 +5,14 @@ use tracing::{debug, info, warn};
 pub async fn check_pactl() -> Result<(), String> {
     debug!("Checking pactl availability");
     match Command::new("pactl").arg("--version").output().await {
-        Ok(_) => {
+        Ok(output) if output.status.success() => {
             info!("pactl: OK");
             Ok(())
         }
+        Ok(output) => Err(format!(
+            "pactl is present but not working (exit status {})",
+            output.status
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err("pactl not found. Install PulseAudio or PipeWire-pulse:\n  \
              Debian/Ubuntu: sudo apt install pulseaudio-utils\n  \

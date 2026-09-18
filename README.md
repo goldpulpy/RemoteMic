@@ -611,7 +611,7 @@ Then start RemoteMic again.
 <summary><strong>The page connects, but there is no sound</strong></summary>
 
 - Confirm that **RemoteMic** is selected in the receiving application.
-- Confirm that the page says **Streaming over LAN**.
+- Confirm that the page says **WebRTC · Opus · LAN**.
 - Check the live RTT, jitter, and packet-loss metrics on the page.
 - Verify that the correct microphone permission was granted.
 - Make sure another application is not holding the phone microphone
