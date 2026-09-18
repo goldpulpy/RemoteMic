@@ -26,6 +26,22 @@ RemoteMic serves its own HTTPS interface with a persistent, self-signed local
 certificate authority, so no external tunnel is required when both devices are
 on the same network.
 
+<p align="center">
+  <img src="assets/web-ready.jpg" width="38%" alt="RemoteMic web interface ready to connect">
+  &nbsp;&nbsp;
+  <img src="assets/web-connected.jpg" width="38%" alt="RemoteMic web interface streaming microphone audio">
+</p>
+
+<details>
+<summary><strong>Show command-line screenshots</strong></summary>
+
+<p align="center">
+  <img src="assets/cli-streaming.jpg" width="49%" alt="RemoteMic running and streaming audio in the terminal">
+  <img src="assets/cli-help.jpg" width="49%" alt="RemoteMic command-line help">
+</p>
+
+</details>
+
 ## ✨ Highlights
 
 - Audio over WebRTC (Opus); the browser encodes, and the server decodes to PCM
@@ -36,6 +52,8 @@ on the same network.
 - Bounded real-time queue that caps backlog and latency growth
 - Live RTT, jitter, packet-loss, and queue metrics on the page
 - A single Rust binary with the web interface embedded in it
+
+<a id="audio-quality"></a>
 
 ## 🎚️ Audio quality
 
@@ -167,6 +185,8 @@ all four values.
 No public tunnel or internet connection is required for a same-network setup.
 
 </details>
+
+<a id="installation"></a>
 
 ## 📦 Installation
 
@@ -321,6 +341,8 @@ negotiation, pipe lifecycle, and periodic byte/frame totals. Stop RemoteMic
 with `Ctrl+C`; it will unload the virtual source and remove its FIFO.
 
 </details>
+
+<a id="quick-start"></a>
 
 ## 🚀 Quick start
 
@@ -513,6 +535,8 @@ network packet loss.
 
 </details>
 
+<a id="security-model"></a>
+
 ## 🔒 Security model
 
 <details>
@@ -536,6 +560,8 @@ network, restrict access where possible, and do not publish the URL. RemoteMic
 does not store recordings or intentionally write captured audio to disk.
 
 </details>
+
+<a id="troubleshooting"></a>
 
 ## ❓ Troubleshooting
 
@@ -716,6 +742,8 @@ The WebSocket carries signaling only and limits messages and frames to 256 KiB.
 Audio travels over WebRTC and is not subject to that limit.
 
 </details>
+
+<a id="license"></a>
 
 ## 📄 License
 
