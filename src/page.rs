@@ -567,6 +567,7 @@ pub const HTML: &str = r#"
       const wakeState = document.getElementById("wake-state");
       const barsEl = document.getElementById("bars");
       const barSpans = barsEl.querySelectorAll("span");
+      const unmutedButtonContent = muteBtn.innerHTML;
 
       const SAMPLE_RATE = __REMOTEMIC_SAMPLE_RATE__;
       const SAMPLE_FORMAT = "__REMOTEMIC_SAMPLE_FORMAT__";
@@ -616,6 +617,9 @@ pub const HTML: &str = r#"
         btn.disabled = false;
         muteBtn.classList.remove("visible", "muted");
         muteBtn.setAttribute("aria-pressed", "false");
+        muteBtn.innerHTML = unmutedButtonContent;
+        barsEl.classList.remove("muted");
+        meterFill.classList.remove("muted");
         wakeWarn.classList.remove("visible");
       }
 
@@ -1092,7 +1096,10 @@ pub const HTML: &str = r#"
           };
 
           socket.onerror = () => {
-            if (isCurrent(session)) setStatus("Could not reach computer", "error");
+            if (!isCurrent(session)) return;
+            if (!session.errorMessage)
+              session.errorMessage = "Could not reach computer";
+            setStatus(session.errorMessage, "error");
           };
         })().catch((err) => {
           if (!isCurrent(session)) return;
