@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub async fn check_pactl() -> Result<(), String> {
+    debug!("Checking pactl availability");
     match Command::new("pactl").arg("--version").output().await {
         Ok(_) => {
             info!("pactl: OK");
@@ -23,6 +24,10 @@ pub async fn check_audio_libs() {
     let required: &[&str] = &["libpulse.so.0", "libasound.so.2"];
     let optional: &[&str] = &["libpipewire-0.3.so.0"];
     let cache = ldconfig_cache().await;
+    debug!(
+        ldconfig_cache_available = cache.is_some(),
+        "Checking audio library availability"
+    );
 
     for lib in required {
         if lib_available(lib, cache.as_deref()) {
@@ -47,6 +52,7 @@ pub async fn check_audio_libs() {
 }
 
 async fn ldconfig_cache() -> Option<String> {
+    debug!("Reading dynamic linker cache with ldconfig");
     let output = Command::new("ldconfig").arg("-p").output().await.ok()?;
     output
         .status

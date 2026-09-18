@@ -2,9 +2,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-const SOURCE_NAME: &str = "RemoteMic";
 const PIPE_FILE_NAME: &str = "remotemic.pipe";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +70,7 @@ pub struct VirtualMic {
     state: Arc<Mutex<VirtualMicState>>,
     pipe_path: PathBuf,
     config: AudioConfig,
+    source_name: Arc<str>,
 }
 
 #[derive(Default)]
@@ -83,11 +83,12 @@ enum VirtualMicState {
 }
 
 impl VirtualMic {
-    pub fn new(config: AudioConfig) -> Self {
+    pub fn new(config: AudioConfig, source_name: impl Into<Arc<str>>) -> Self {
         Self {
             state: Arc::new(Mutex::new(VirtualMicState::Unloaded)),
             pipe_path: default_pipe_path(),
             config,
+            source_name: source_name.into(),
         }
     }
 
@@ -96,6 +97,13 @@ impl VirtualMic {
     }
 
     pub async fn load(&self) -> Result<(), String> {
+        debug!(
+            source_name = %self.source_name,
+            pipe_path = %self.pipe_path.display(),
+            sample_rate = self.config.sample_rate,
+            sample_format = self.config.sample_format.pulse_name(),
+            "Preparing virtual microphone"
+        );
         let mut state = self.state.lock().await;
 
         if matches!(*state, VirtualMicState::Loaded { .. }) {
@@ -120,6 +128,7 @@ impl VirtualMic {
         info!("Loading PulseAudio module-pipe-source");
 
         let pipe_path = self.pipe_path.clone();
+        let source_name = self.source_name.clone();
         let format_arg = format!("format={}", self.config.sample_format.pulse_name());
         let rate_arg = format!("rate={}", self.config.sample_rate);
         let output = tokio::task::spawn_blocking(move || {
@@ -127,7 +136,7 @@ impl VirtualMic {
                 .args([
                     "load-module",
                     "module-pipe-source",
-                    &format!("source_name={SOURCE_NAME}"),
+                    &format!("source_name={source_name}"),
                     &format!("file={}", pipe_path.display()),
                     &format_arg,
                     &rate_arg,
@@ -155,6 +164,7 @@ impl VirtualMic {
             .map_err(|e| format!("Unexpected pactl output {:?}: {e}", stdout.trim()))?;
 
         info!("module-pipe-source loaded (index {module_index})");
+        debug!(module_index, source_name = %self.source_name, "Virtual microphone is ready");
         *state = VirtualMicState::Loaded { module_index };
         Ok(())
     }
@@ -203,9 +213,12 @@ impl VirtualMic {
     }
 
     async fn remove_pipe_file(&self) {
+        debug!(pipe_path = %self.pipe_path.display(), "Removing audio pipe file");
         match tokio::fs::remove_file(&self.pipe_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(()) => debug!(pipe_path = %self.pipe_path.display(), "Audio pipe file removed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(pipe_path = %self.pipe_path.display(), "Audio pipe file already absent");
+            }
             Err(e) => warn!(
                 "Failed to remove pipe file {}: {}",
                 self.pipe_path.display(),

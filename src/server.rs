@@ -15,7 +15,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{audio::AudioConfig, page};
 
@@ -46,6 +46,7 @@ impl SessionRegistry {
     async fn acquire(&self) -> Option<u64> {
         let session_id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let deadline = tokio::time::Instant::now() + ACQUIRE_RETRY_TIMEOUT;
+        trace!(session_id, "Attempting to acquire audio session");
 
         loop {
             if self
@@ -53,10 +54,12 @@ impl SessionRegistry {
                 .compare_exchange(0, session_id, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                debug!(session_id, "Audio session acquired");
                 return Some(session_id);
             }
 
             if tokio::time::Instant::now() >= deadline {
+                debug!(session_id, "Timed out waiting for active audio session");
                 return None;
             }
 
@@ -65,9 +68,11 @@ impl SessionRegistry {
     }
 
     fn release(&self, session_id: u64) {
-        let _ = self
+        let released = self
             .active
-            .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire);
+            .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        debug!(session_id, released, "Audio session release requested");
     }
 
     pub fn is_active(&self, session_id: u64) -> bool {
@@ -81,6 +86,12 @@ impl Server {
             "{:016x}{:016x}",
             rand::random::<u64>(),
             rand::random::<u64>()
+        );
+
+        debug!(
+            sample_rate = audio_config.sample_rate,
+            sample_format = audio_config.sample_format.pulse_name(),
+            "Creating server state"
         );
 
         Self {
@@ -108,6 +119,7 @@ impl Server {
 // ---------------------------------------------------------------------------
 
 async fn index_handler(State(state): State<Server>) -> Html<String> {
+    debug!("Serving microphone control page");
     Html(render_page(&state.token, state.audio_config))
 }
 
@@ -158,6 +170,8 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Server>, uri: Uri)
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
 
+    debug!("Authorized WebSocket upgrade request");
+
     ws.max_message_size(MAX_WS_MESSAGE_SIZE)
         .max_frame_size(MAX_WS_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_socket(socket, state))
@@ -187,10 +201,21 @@ async fn handle_socket(socket: WebSocket, state: Server) {
 
     let audio_tx = state.audio_tx.clone();
     let mut dropped_frames = 0_u64;
+    let mut received_frames = 0_u64;
+    let mut received_bytes = 0_u64;
 
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
+                received_frames += 1;
+                received_bytes += data.len() as u64;
+                trace!(
+                    session_id,
+                    bytes = data.len(),
+                    received_frames,
+                    received_bytes,
+                    "Received audio frame"
+                );
                 let frame = AudioFrame {
                     session_id,
                     data: data.to_vec(),
@@ -211,11 +236,11 @@ async fn handle_socket(socket: WebSocket, state: Server) {
                     }
                 }
             }
-            Ok(Message::Close(_)) => {
-                info!("Client sent close frame");
+            Ok(Message::Close(reason)) => {
+                info!(session_id, ?reason, "Client sent close frame");
                 break;
             }
-            Ok(_) => {}
+            Ok(message) => trace!(session_id, ?message, "Received non-audio WebSocket message"),
             Err(e) => {
                 error!("WebSocket receive error: {e}");
                 break;
@@ -224,7 +249,10 @@ async fn handle_socket(socket: WebSocket, state: Server) {
     }
 
     state.sessions.release(session_id);
-    info!("Client disconnected (session {session_id}, dropped {dropped_frames} frames)");
+    info!(
+        session_id,
+        received_frames, received_bytes, dropped_frames, "Client disconnected"
+    );
 }
 
 #[cfg(test)]

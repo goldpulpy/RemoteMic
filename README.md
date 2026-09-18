@@ -197,11 +197,16 @@ make release
 Usage: remotemic [OPTIONS]
 
 Options:
+  -b, --bind <ADDRESS>       Bind to this IP address (default: 0.0.0.0)
   -p, --port <PORT>          Listen on this port (default: random)
   -q, --quality <QUALITY>    low: 16 kHz/16-bit
                              standard: 44.1 kHz/16-bit (default)
                              high: 48 kHz/32-bit float
+  -n, --source-name <NAME>   PulseAudio source name (default: RemoteMic)
+      --queue-size <FRAMES>  Buffered audio frames, 1-1024 (default: 8)
+  -l, --log-level <LEVEL>    error, warn, info, debug, or trace (default: info)
   -h, --help                 Print help
+  -V, --version              Print version
 ```
 
 With no arguments, RemoteMic selects a random available port in the dynamic
@@ -235,9 +240,58 @@ Combine both options:
 remotemic --port 9000 --quality high
 ```
 
+Listen only on the local computer instead of every network interface:
+
+```bash
+remotemic --bind 127.0.0.1 --port 9000
+```
+
+Choose the PulseAudio/PipeWire source name shown to audio applications:
+
+```bash
+remotemic --source-name studio_mic
+```
+
+Source names may contain ASCII letters, digits, `.`, `-`, and `_`.
+
+Increase the bounded audio queue when short scheduling stalls cause gaps. A
+larger queue can absorb longer stalls, but it can also add latency:
+
+```bash
+remotemic --queue-size 32
+```
+
+Enable startup, session, FIFO, and periodic audio-transfer diagnostics:
+
+```bash
+remotemic --log-level debug
+```
+
+For per-frame WebSocket and FIFO events, use `trace`. This is intentionally
+very verbose and is best reserved for short troubleshooting sessions:
+
+```bash
+remotemic --log-level trace
+```
+
+All options can be combined:
+
+```bash
+remotemic --bind 0.0.0.0 --port 9000 --quality high \
+  --source-name studio_mic --queue-size 32 --log-level debug
+```
+
+Print the installed version:
+
+```bash
+remotemic --version
+```
+
 On startup, the terminal shows the selected audio format, local URL, and
-connection events. Stop RemoteMic with `Ctrl+C`; it will unload the virtual
-source and remove its FIFO.
+connection events. Debug logging additionally shows configuration, startup
+checks, session acquisition, pipe lifecycle, and periodic byte/frame totals.
+Stop RemoteMic with `Ctrl+C`; it will unload the virtual source and remove its
+FIFO.
 
 </details>
 
@@ -311,11 +365,11 @@ account plan. See the official
 
 #### Tunnel comparison
 
-| Option | Account required | Typical command | Best suited for |
-| --- | --- | --- | --- |
-| LocalTunnel | No | `npx localtunnel --port 9000` | fastest setup with Node.js |
-| Cloudflare Quick Tunnel | No | `cloudflared tunnel --url http://localhost:9000` | temporary testing with a standalone client |
-| ngrok | Yes | `ngrok http 9000` | managed endpoints and access controls |
+| Option                  | Account required | Typical command                                  | Best suited for                            |
+| ----------------------- | ---------------- | ------------------------------------------------ | ------------------------------------------ |
+| LocalTunnel             | No               | `npx localtunnel --port 9000`                    | fastest setup with Node.js                 |
+| Cloudflare Quick Tunnel | No               | `cloudflared tunnel --url http://localhost:9000` | temporary testing with a standalone client |
+| ngrok                   | Yes              | `ngrok http 9000`                                | managed endpoints and access controls      |
 
 Open the generated HTTPS address on the phone. Keep both RemoteMic and the
 tunnel process running for the entire session. A tunnel relays the uncompressed
