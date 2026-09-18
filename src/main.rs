@@ -4,9 +4,10 @@ mod preflight;
 mod server;
 
 use audio::VirtualMic;
-use server::Server;
+use server::{AudioFrame, Server, SessionRegistry};
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::net::unix::pipe;
 use tokio::sync::mpsc;
 use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
@@ -19,9 +20,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let port = parse_port_arg().unwrap_or(get_available_port().await?);
-
-    info!("RemoteMic starting on port {port}");
+    let requested_port = match parse_port_arg() {
+        Ok(port) => port,
+        Err(msg) => {
+            error!("{msg}\nUsage: remotemic [-p <port>]");
+            std::process::exit(1);
+        }
+    };
 
     if let Err(msg) = preflight::check_pactl().await {
         error!("{msg}");
@@ -34,14 +39,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     virtual_mic.load().await?;
 
     let pipe_path = virtual_mic.pipe_path();
-    let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(8);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = bind_listener(requested_port).await?;
+    let port = listener.local_addr()?.port();
+    info!("RemoteMic starting on port {port}");
     let server = Server::new(audio_tx);
 
     print_access_urls(port);
 
-    let writer = tokio::spawn(audio_writer_loop(pipe_path, audio_rx));
+    let writer = tokio::spawn(audio_writer_loop(pipe_path, audio_rx, server.sessions()));
     let app = server.router();
 
     axum::serve(listener, app)
@@ -52,7 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.abort();
     let _ = writer.await;
 
-    virtual_mic.unload().await?;
+    if let Err(e) = virtual_mic.unload().await {
+        error!("{e}");
+    }
 
     info!("RemoteMic stopped");
     Ok(())
@@ -62,21 +71,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn get_available_port() -> Result<u16, std::io::Error> {
-    loop {
-        let port = rand::random_range(49152..=65535);
-
-        if let Ok(listener) = tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
-            drop(listener);
-            return Ok(port);
-        }
+async fn bind_listener(port: Option<u16>) -> Result<tokio::net::TcpListener, std::io::Error> {
+    match port {
+        Some(port) => tokio::net::TcpListener::bind(("0.0.0.0", port)).await,
+        None => loop {
+            let candidate = rand::random_range(49152..=65535);
+            if let Ok(listener) = tokio::net::TcpListener::bind(("0.0.0.0", candidate)).await {
+                return Ok(listener);
+            }
+        },
     }
 }
 
-fn parse_port_arg() -> Option<u16> {
+fn parse_port_arg() -> Result<Option<u16>, String> {
     let args: Vec<String> = std::env::args().collect();
-    let idx = args.iter().position(|a| a == "-p" || a == "--port")?;
-    args.get(idx + 1)?.parse().ok()
+    let Some(idx) = args.iter().position(|a| a == "-p" || a == "--port") else {
+        return Ok(None);
+    };
+    let value = args
+        .get(idx + 1)
+        .ok_or_else(|| "Missing value after -p/--port".to_string())?;
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("Invalid port \"{value}\": expected a number 0-65535"))?;
+    Ok(Some(port))
 }
 
 fn print_access_urls(port: u16) {
@@ -117,7 +135,11 @@ async fn shutdown_signal() {
 // Audio pipe writer
 // ---------------------------------------------------------------------------
 
-async fn audio_writer_loop(path: PathBuf, mut rx: mpsc::Receiver<Vec<u8>>) {
+async fn audio_writer_loop(
+    path: PathBuf,
+    mut rx: mpsc::Receiver<AudioFrame>,
+    sessions: SessionRegistry,
+) {
     info!("Audio writer ready, waiting for data on {}", path.display());
 
     loop {
@@ -126,35 +148,32 @@ async fn audio_writer_loop(path: PathBuf, mut rx: mpsc::Receiver<Vec<u8>>) {
             None => return,
         };
 
-        let p = path.clone();
-        let file_result =
-            tokio::task::spawn_blocking(move || std::fs::OpenOptions::new().write(true).open(&p))
-                .await;
+        if !sessions.is_active(first.session_id) {
+            continue;
+        }
 
-        let std_file = match file_result {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => {
+        let mut writer = match pipe::OpenOptions::new().read_write(true).open_sender(&path) {
+            Ok(writer) => writer,
+            Err(e) => {
                 error!("Failed to open pipe for writing: {e}");
                 drain_channel(&mut rx).await;
                 continue;
             }
-            Err(e) => {
-                error!("Pipe open task failed: {e}");
-                return;
-            }
         };
 
-        let mut file = tokio::fs::File::from_std(std_file);
         info!("Pipe opened, streaming audio");
 
-        if write_chunk(&mut file, &first).await.is_err() {
+        if write_chunk(&mut writer, &first.data).await.is_err() {
             continue;
         }
 
         loop {
             match rx.recv().await {
-                Some(data) => {
-                    if write_chunk(&mut file, &data).await.is_err() {
+                Some(frame) => {
+                    if !sessions.is_active(frame.session_id) {
+                        continue;
+                    }
+                    if write_chunk(&mut writer, &frame.data).await.is_err() {
                         break;
                     }
                 }
@@ -167,12 +186,15 @@ async fn audio_writer_loop(path: PathBuf, mut rx: mpsc::Receiver<Vec<u8>>) {
     }
 }
 
-async fn write_chunk(file: &mut tokio::fs::File, data: &[u8]) -> Result<(), ()> {
-    file.write_all(data).await.map_err(|e| {
+async fn write_chunk<W>(writer: &mut W, data: &[u8]) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(data).await.map_err(|e| {
         warn!("Pipe write error (client disconnected?): {e}");
     })
 }
 
-async fn drain_channel(rx: &mut mpsc::Receiver<Vec<u8>>) {
+async fn drain_channel(rx: &mut mpsc::Receiver<AudioFrame>) {
     while rx.try_recv().is_ok() {}
 }

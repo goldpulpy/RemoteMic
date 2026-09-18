@@ -12,34 +12,43 @@ Laptop microphones are often low quality. RemoteMic lets you use your phone’s 
 
 ```mermaid
 flowchart LR
-    subgraph Phone["Phone / Browser Device"]
-        Mic["Microphone"]
-        Browser["Web Browser"]
+    subgraph Phone["Phone browser"]
+        Mic["getUserMedia microphone"]
+        WebAudio["Web Audio\nmono + 44.1 kHz resampling"]
+        PCM["signed 16-bit little-endian PCM"]
+        Mic --> WebAudio --> PCM
     end
 
     subgraph PC["Linux PC"]
-        Server["RemoteMic Server"]
-        Pipe["Named Pipe (FIFO)"]
-        Pulse["PulseAudio / PipeWire"]
-        Source["Virtual Mic: RemoteMic"]
+        Session["Axum WebSocket\nsingle active session"]
+        Queue["small real-time queue\nstale frames discarded"]
+        Pipe["per-user FIFO\n(0700 runtime dir)"]
+        Module["PulseAudio module-pipe-source\nor PipeWire Pulse compatibility"]
+        Source["System input: RemoteMic"]
+        Session --> Queue --> Pipe --> Module --> Source
     end
 
-    Mic --> Browser
-    Browser -- "WebSocket (16-bit PCM audio)" --> Server
-    Server --> Pipe
-    Pipe --> Pulse
-    Pulse --> Source
+    PCM -- "binary WebSocket frames" --> Session
 ```
 
 ### Architecture Overview
 
-1. The **RemoteMic server** runs on your Linux PC.
-2. It creates a **virtual microphone source** using PulseAudio (`module-pipe-source`) or PipeWire compatibility.
-3. A browser device connects via **WebSocket** over the network.
-4. The browser captures microphone audio using the Web Audio API.
-5. Audio is streamed as **16-bit PCM (mono or stereo)** to the server.
-6. The server writes audio into a **named pipe (FIFO)**.
-7. PulseAudio/PipeWire exposes it as an input device: **RemoteMic**.
+1. RemoteMic loads PulseAudio's `module-pipe-source` (also provided by
+   PipeWire's PulseAudio compatibility layer). The module reads a mono,
+   44.1 kHz `s16le` stream from a per-user FIFO (kept in
+   `$XDG_RUNTIME_DIR/remotemic` with `0700` permissions, falling back to
+   `$TMPDIR/remotemic-<uid>`) and exposes the **RemoteMic** system input.
+2. After **Connect microphone** is tapped, the page opens one WebSocket session
+   and asks the browser for a mono microphone stream with `getUserMedia`.
+3. Web Audio supplies floating-point samples. The page resamples them to
+   44.1 kHz when necessary, converts them to signed 16-bit little-endian PCM,
+   and sends binary WebSocket frames.
+4. The server accepts one client at a time. It tags frames with the current
+   session, uses a deliberately small bounded queue, drops frames rather than
+   accumulating latency when the output stalls, and rejects frames left by a
+   disconnected session.
+5. A long-running writer feeds current-session frames into the FIFO for the
+   virtual source.
 
 ---
 
@@ -157,9 +166,16 @@ You can also use alternatives like:
 ### 4. Connect from Your Phone
 
 1. Open the tunnel URL in your phone browser
-2. Tap **Connect**
+2. Tap **Connect microphone**
 3. Grant microphone permissions
-4. Audio will stream live to your Linux PC
+4. Keep the page visible while audio streams to your Linux PC
+
+**Mute** pauses PCM transmission but keeps the microphone, WebSocket, and
+virtual-source session alive, so unmuting is immediate. **Disconnect
+microphone** stops the browser tracks, closes the audio graph and WebSocket,
+releases the screen wake lock, and makes the server slot available for the next
+connection. A fast reconnect waits briefly for the previous WebSocket close so
+callbacks from the old session cannot tear down the new one.
 
 ---
 
@@ -169,6 +185,8 @@ You can also use alternatives like:
 - **Single active client** (prevents audio conflicts)
 - **Mute toggle** (pause streaming without disconnecting)
 - **Live audio level meter**
+- **Screen Wake Lock while connected**, with a clear fallback when unsupported
+- **Reconnect-safe session cleanup** with stale audio rejection
 - **Graceful shutdown and cleanup**
 - **Real-time connection logs in terminal**
 
@@ -177,10 +195,10 @@ You can also use alternatives like:
 ## Audio Format
 
 - Codec: Raw PCM
-- Bit depth: 16-bit signed integer
-- Channels: Mono (default) / configurable stereo
+- Sample encoding: signed 16-bit little-endian (`s16le`)
+- Channels: 1 (mono)
+- Sample rate: 44,100 Hz (browser input is resampled when needed)
 - Transport: WebSocket
-- Typical sample rate: 44.1kHz or 48kHz (browser-dependent)
 
 ---
 
@@ -237,6 +255,18 @@ Check:
 - Browser microphone permission granted
 - Phone tab is actively connected (not background-suspended)
 - Refresh browser page and reconnect
+
+### Streaming stops when the phone sleeps
+
+RemoteMic requests the Screen Wake Lock API for each active connection and
+requests it again when the page becomes visible after being backgrounded. If
+the browser does not support wake lock or refuses it, the page shows a warning;
+leave the page visible and keep the screen on manually.
+
+On iOS Safari, wake lock can prevent the normal automatic screen timeout on
+supported versions, but a web page cannot guarantee continued microphone
+capture after you manually lock the phone. Do not press the lock button while
+streaming.
 
 ---
 

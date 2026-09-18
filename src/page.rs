@@ -23,7 +23,7 @@ pub const HTML: &str = r#"
         --surface: #faf9f6;
         --border: #ddd9d0;
         --text: #1a1816;
-        --muted: #8c887f;
+        --muted: #6f6a61;
         --accent: #2a2420;
         --ok: #2d6a4f;
         --ok-bg: #d8f3dc;
@@ -39,7 +39,7 @@ pub const HTML: &str = r#"
           --surface: #1c1a17;
           --border: #2e2b26;
           --text: #e8e4dc;
-          --muted: #6e6a62;
+          --muted: #aaa49a;
           --accent: #e8e4dc;
           --ok: #52b788;
           --ok-bg: #0e2e1e;
@@ -113,6 +113,23 @@ pub const HTML: &str = r#"
         text-transform: uppercase;
         font-weight: 300;
       }
+      .intro {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .intro h2 {
+        font-family: "Instrument Serif", serif;
+        font-size: 1.55rem;
+        font-weight: 400;
+        line-height: 1.08;
+        letter-spacing: -0.01em;
+      }
+      .intro p {
+        color: var(--muted);
+        font-size: 0.72rem;
+        line-height: 1.65;
+      }
       .mic-glyph {
         width: 40px;
         height: 40px;
@@ -142,6 +159,39 @@ pub const HTML: &str = r#"
         align-items: center;
         justify-content: space-between;
       }
+      .status-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: color-mix(in srgb, var(--surface) 88%, var(--bg));
+      }
+      .session-facts {
+        display: grid;
+        gap: 8px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border);
+      }
+      .fact {
+        display: grid;
+        grid-template-columns: 58px 1fr;
+        align-items: baseline;
+        gap: 10px;
+        font-size: 0.68rem;
+        line-height: 1.4;
+      }
+      .fact-label {
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        font-size: 0.61rem;
+      }
+      .fact-value {
+        color: var(--text);
+        text-align: right;
+      }
       .status-label {
         font-size: 0.65rem;
         letter-spacing: 0.1em;
@@ -160,6 +210,8 @@ pub const HTML: &str = r#"
         color: var(--muted);
         background: transparent;
         transition: all 0.2s;
+        max-width: 72%;
+        text-align: right;
       }
       .badge .dot {
         width: 5px;
@@ -283,7 +335,8 @@ pub const HTML: &str = r#"
       }
       button#btn {
         flex: 1;
-        padding: 12px;
+        min-height: 50px;
+        padding: 13px 16px;
         font-family: "DM Mono", monospace;
         font-size: 0.78rem;
         font-weight: 500;
@@ -305,6 +358,10 @@ pub const HTML: &str = r#"
       button#btn:active {
         transform: scale(0.98);
       }
+      button:focus-visible {
+        outline: 3px solid color-mix(in srgb, var(--ok) 45%, transparent);
+        outline-offset: 3px;
+      }
       button#btn:disabled {
         opacity: 0.3;
         cursor: not-allowed;
@@ -319,7 +376,8 @@ pub const HTML: &str = r#"
         background: var(--err-bg);
       }
       button#mute-btn {
-        padding: 12px 14px;
+        min-height: 50px;
+        padding: 12px 16px;
         font-family: "DM Mono", monospace;
         font-size: 0.78rem;
         font-weight: 500;
@@ -368,6 +426,24 @@ pub const HTML: &str = r#"
         line-height: 1.7;
         letter-spacing: 0.02em;
       }
+      @media (max-width: 420px) {
+        body {
+          justify-content: flex-start;
+          padding: 16px;
+        }
+        .card {
+          margin: max(8px, env(safe-area-inset-top)) 0
+            max(8px, env(safe-area-inset-bottom));
+          padding: 28px 22px 22px;
+          gap: 18px;
+        }
+        .btn-row {
+          flex-direction: column;
+        }
+        button#mute-btn.visible {
+          width: 100%;
+        }
+      }
     </style>
   </head>
   <body>
@@ -389,21 +465,49 @@ pub const HTML: &str = r#"
 
       <div class="divider"></div>
 
-      <div class="status-row">
-        <span class="status-label">Status</span>
-        <div id="badge" class="badge">
-          <span class="dot"></span>
-          <span id="badge-text">Disconnected</span>
+      <div class="intro">
+        <h2>Use this phone as your computer’s microphone.</h2>
+        <p>
+          Connect once, allow microphone access, then keep this page open while
+          you talk.
+        </p>
+      </div>
+
+      <div class="status-panel" aria-live="polite">
+        <div class="status-row">
+          <span class="status-label">Connection</span>
+          <div id="badge" class="badge">
+            <span class="dot"></span>
+            <span id="badge-text">Ready</span>
+          </div>
+        </div>
+        <div class="session-facts">
+          <div class="fact">
+            <span class="fact-label">Mic</span>
+            <span class="fact-value" id="mic-state">Off</span>
+          </div>
+          <div class="fact">
+            <span class="fact-label">Audio</span>
+            <span class="fact-value" id="stream-state">Not sending</span>
+          </div>
+          <div class="fact">
+            <span class="fact-label">Screen</span>
+            <span class="fact-value" id="wake-state">Managed when connected</span>
+          </div>
         </div>
       </div>
 
       <div id="https-warning" class="warn-box">
-        <strong>Microphone blocked</strong><br />
-        Browsers only allow mic access on <code>localhost</code> or
-        <code>https://</code>.<br /><br />
-        Fix: run on your PC:<br />
-        <code>npx localtunnel --port 8080</code><br />
-        Then open the <code>https://…</code> link on your phone.
+        <strong>A secure link is needed</strong><br />
+        Your browser will only share the microphone over HTTPS. On the computer,
+        run <code id="tunnel-command">npx localtunnel</code>, then open its
+        <code>https://…</code> link here.
+      </div>
+
+      <div id="wake-warning" class="warn-box">
+        <strong>Keep the screen on</strong><br />
+        This browser cannot prevent sleep. Leave this page visible and do not
+        lock the phone while streaming.
       </div>
 
       <div class="bars" id="bars">
@@ -417,8 +521,8 @@ pub const HTML: &str = r#"
       </div>
 
       <div class="btn-row">
-        <button id="btn">Connect</button>
-        <button id="mute-btn">
+        <button id="btn">Connect microphone</button>
+        <button id="mute-btn" aria-pressed="false">
           <svg
             width="14"
             height="14"
@@ -439,7 +543,7 @@ pub const HTML: &str = r#"
       </div>
 
       <p class="hint">
-        Open on your device · tap Connect · audio streams to your PC
+        Your microphone is used only while this page is connected.
       </p>
     </div>
 
@@ -453,22 +557,29 @@ pub const HTML: &str = r#"
       const meterWrap = document.getElementById("meter-wrap");
       const meterFill = document.getElementById("meter-fill");
       const httpsWarn = document.getElementById("https-warning");
+      const wakeWarn = document.getElementById("wake-warning");
+      const tunnelCommand = document.getElementById("tunnel-command");
+      const micState = document.getElementById("mic-state");
+      const streamState = document.getElementById("stream-state");
+      const wakeState = document.getElementById("wake-state");
       const barsEl = document.getElementById("bars");
       const barSpans = barsEl.querySelectorAll("span");
 
       const SAMPLE_RATE = 44100;
       const BUFFER_SIZE = 4096;
+      const MAX_BUFFERED_BYTES = BUFFER_SIZE * 2 * 4;
+      const TOKEN = "__REMOTEMIC_TOKEN__";
 
-      let ws = null,
-        audioCtx = null,
-        processor = null,
-        analyser = null,
-        stream = null,
-        meterRaf = null,
-        isMuted = false;
+      let currentSession = null;
+      let nextSessionId = 0;
+      let previousSocketClosed = Promise.resolve();
 
       const isSecureContext = window.isSecureContext;
-      if (!isSecureContext) httpsWarn.classList.add("visible");
+      if (!isSecureContext) {
+        httpsWarn.classList.add("visible");
+        if (location.port)
+          tunnelCommand.textContent = `npx localtunnel --port ${location.port}`;
+      }
 
       function setStatus(text, cls) {
         badge.className = "badge " + (cls || "");
@@ -477,11 +588,35 @@ pub const HTML: &str = r#"
 
       function wsUrl() {
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        return `${proto}//${location.host}/ws`;
+        return `${proto}//${location.host}/ws?token=${encodeURIComponent(TOKEN)}`;
       }
 
-      function applyMuteVisuals() {
-        if (isMuted) {
+      function isCurrent(session) {
+        return currentSession === session && !session.cleaned;
+      }
+
+      function setDetails(mic, audio, screen) {
+        micState.textContent = mic;
+        streamState.textContent = audio;
+        wakeState.textContent = screen;
+      }
+
+      function resetUi(statusText = "Ready", statusClass = "") {
+        setStatus(statusText, statusClass);
+        setDetails("Off", "Not sending", "Managed when connected");
+        btn.textContent = "Connect microphone";
+        btn.classList.remove("disconnect");
+        btn.disabled = false;
+        muteBtn.classList.remove("visible", "muted");
+        muteBtn.setAttribute("aria-pressed", "false");
+        wakeWarn.classList.remove("visible");
+      }
+
+      function applyMuteVisuals(session) {
+        if (!isCurrent(session)) return;
+        muteBtn.setAttribute("aria-pressed", String(session.muted));
+
+        if (session.muted) {
           muteBtn.textContent = "";
           const svg = document.createElementNS(
             "http://www.w3.org/2000/svg",
@@ -503,6 +638,7 @@ pub const HTML: &str = r#"
           barsEl.classList.add("muted");
           meterFill.classList.add("muted");
           setStatus("Muted", "muted");
+          setDetails("Muted", "Paused — still connected", wakeState.textContent);
         } else {
           muteBtn.innerHTML = "";
           const svg = document.createElementNS(
@@ -524,17 +660,18 @@ pub const HTML: &str = r#"
           muteBtn.classList.remove("muted");
           barsEl.classList.remove("muted");
           meterFill.classList.remove("muted");
-          setStatus("Connected", "connected");
+          setStatus("Streaming audio", "connected");
+          setDetails("On", "Sending to computer", wakeState.textContent);
         }
       }
 
-      async function startAudio() {
+      async function startAudio(session) {
         if (!isSecureContext)
           throw new Error("Requires HTTPS. See warning above.");
         if (!navigator.mediaDevices?.getUserMedia)
           throw new Error("getUserMedia not available.");
 
-        stream = await navigator.mediaDevices.getUserMedia({
+        const mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             sampleRate: SAMPLE_RATE,
             channelCount: 1,
@@ -544,135 +681,331 @@ pub const HTML: &str = r#"
           },
         });
 
-        audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-        const src = audioCtx.createMediaStreamSource(stream);
+        if (!isCurrent(session)) {
+          mediaStream.getTracks().forEach((track) => track.stop());
+          throw new Error("Connection cancelled.");
+        }
 
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 64;
-        analyser.smoothingTimeConstant = 0.7;
+        session.stream = mediaStream;
+        micState.textContent = "On";
+        const audioCtx = session.audioCtx;
+        await audioCtx.resume();
+        if (!isCurrent(session)) throw new Error("Connection cancelled.");
+        if (audioCtx.sampleRate !== SAMPLE_RATE)
+          console.info(
+            `Resampling microphone from ${audioCtx.sampleRate} Hz to ${SAMPLE_RATE} Hz`,
+          );
 
-        processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
-        processor.onaudioprocess = (ev) => {
-          if (!ws || ws.readyState !== WebSocket.OPEN) return;
-          if (isMuted) return;
-          const f32 = ev.inputBuffer.getChannelData(0);
-          const i16 = new Int16Array(f32.length);
-          for (let i = 0; i < f32.length; i++) {
-            const c = Math.max(-1, Math.min(1, f32[i]));
-            i16[i] = c < 0 ? c * 0x8000 : c * 0x7fff;
+        session.source = audioCtx.createMediaStreamSource(mediaStream);
+
+        session.analyser = audioCtx.createAnalyser();
+        session.analyser.fftSize = 64;
+        session.analyser.smoothingTimeConstant = 0.7;
+
+        session.processor = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+        session.processor.onaudioprocess = (ev) => {
+          const socket = session.socket;
+          if (!isCurrent(session) || session.muted) return;
+          if (!socket || socket.readyState !== WebSocket.OPEN) return;
+          if (socket.bufferedAmount > MAX_BUFFERED_BYTES) {
+            session.droppedFrames++;
+            return;
           }
-          ws.send(i16.buffer);
+
+          const f32 = ev.inputBuffer.getChannelData(0);
+          const pcm = resample(f32, audioCtx.sampleRate, session.resampler);
+          const buffer = new ArrayBuffer(pcm.length * 2);
+          const view = new DataView(buffer);
+          for (let i = 0; i < pcm.length; i++) {
+            const c = Math.max(-1, Math.min(1, pcm[i]));
+            const sample = c < 0 ? c * 0x8000 : c * 0x7fff;
+            view.setInt16(i * 2, sample, true);
+          }
+          socket.send(buffer);
         };
 
-        src.connect(analyser);
-        src.connect(processor);
-        processor.connect(audioCtx.destination);
+        session.source.connect(session.analyser);
+        session.source.connect(session.processor);
+        session.processor.connect(audioCtx.destination);
 
-        startMeter();
+        startMeter(session);
       }
 
-      function startMeter() {
+      function resample(input, inputRate, state) {
+        if (input.length === 0) return input;
+        if (inputRate === SAMPLE_RATE) return input;
+
+        const step = inputRate / SAMPLE_RATE;
+        const output = [];
+        let position = state.position;
+        while (position < input.length - 1) {
+          const index = Math.floor(position);
+          const fraction = position - index;
+          const left = index < 0 ? state.previous : input[index];
+          const right = input[index + 1];
+          output.push(left + (right - left) * fraction);
+          position += step;
+        }
+        state.position = position - input.length;
+        state.previous = input[input.length - 1];
+        return output;
+      }
+
+      function startMeter(session) {
         meterWrap.classList.add("active");
         barsEl.classList.add("active", "live");
 
-        const timeBuf = new Uint8Array(analyser.frequencyBinCount);
-        const freqBuf = new Uint8Array(analyser.frequencyBinCount);
+        const timeBuf = new Uint8Array(session.analyser.frequencyBinCount);
+        const freqBuf = new Uint8Array(session.analyser.frequencyBinCount);
 
         function tick() {
-          analyser.getByteTimeDomainData(timeBuf);
+          if (!isCurrent(session)) return;
+          session.analyser.getByteTimeDomainData(timeBuf);
           let peak = 0;
           for (let i = 0; i < timeBuf.length; i++)
             peak = Math.max(peak, Math.abs(timeBuf[i] - 128));
           meterFill.style.width = Math.min(100, (peak / 128) * 200) + "%";
 
-          analyser.getByteFrequencyData(freqBuf);
+          session.analyser.getByteFrequencyData(freqBuf);
           const step = Math.floor(freqBuf.length / barSpans.length);
           barSpans.forEach((bar, i) => {
-            const val = isMuted ? 0 : freqBuf[i * step] || 0;
+            const val = session.muted ? 0 : freqBuf[i * step] || 0;
             bar.style.height = 4 + (val / 255) * 22 + "px";
           });
 
-          meterRaf = requestAnimationFrame(tick);
+          session.meterRaf = requestAnimationFrame(tick);
         }
-        meterRaf = requestAnimationFrame(tick);
+        session.meterRaf = requestAnimationFrame(tick);
       }
 
-      function stopMeter() {
-        if (meterRaf) cancelAnimationFrame(meterRaf);
-        meterRaf = null;
+      function stopMeter(session) {
+        if (session.meterRaf) cancelAnimationFrame(session.meterRaf);
+        session.meterRaf = null;
         meterWrap.classList.remove("active");
         meterFill.style.width = "0%";
         barsEl.classList.remove("active", "live", "muted");
         barSpans.forEach((b) => (b.style.height = "4px"));
       }
 
-      function connect() {
-        if (ws) return;
-        btn.disabled = true;
-        setStatus("Connecting…", "connecting");
+      async function requestWakeLock(session) {
+        if (!isCurrent(session) || document.visibilityState !== "visible") return;
+        if (!("wakeLock" in navigator)) {
+          wakeWarn.classList.add("visible");
+          wakeState.textContent = "Keep on manually";
+          return;
+        }
+        if (session.wakeLock && !session.wakeLock.released) return;
+        if (session.wakeLockRequest) return session.wakeLockRequest;
 
-        ws = new WebSocket(wsUrl());
-        ws.binaryType = "arraybuffer";
-
-        ws.onopen = async () => {
-          try {
-            await startAudio();
-            setStatus("Connected", "connected");
-            btn.textContent = "Disconnect";
-            btn.classList.add("disconnect");
-            btn.disabled = false;
-            muteBtn.classList.add("visible");
-          } catch (err) {
-            setStatus("Error: " + err.message, "error");
-            ws.close();
+        const request = navigator.wakeLock.request("screen");
+        session.wakeLockRequest = request;
+        try {
+          const sentinel = await request;
+          if (!isCurrent(session)) {
+            await sentinel.release();
+            return;
           }
-        };
+          session.wakeLock = sentinel;
+          wakeWarn.classList.remove("visible");
+          wakeState.textContent = "Stays awake while connected";
+          sentinel.addEventListener("release", () => {
+            if (session.wakeLock === sentinel) session.wakeLock = null;
+            if (isCurrent(session)) wakeState.textContent = "Paused while hidden";
+          });
+        } catch (err) {
+          if (isCurrent(session)) {
+            console.warn("Screen wake lock unavailable:", err);
+            wakeWarn.classList.add("visible");
+            wakeState.textContent = "Keep on manually";
+          }
+        } finally {
+          if (session.wakeLockRequest === request)
+            session.wakeLockRequest = null;
+        }
+      }
 
-        ws.onmessage = ({ data }) => {
-          if (typeof data === "string") console.info("Server:", data);
-        };
+      function waitForSocketClose(session) {
+        const socket = session.socket;
+        if (!socket || socket.readyState === WebSocket.CLOSED)
+          return Promise.resolve();
 
-        ws.onclose = () => {
-          cleanup();
-          setStatus("Disconnected", "");
-          btn.textContent = "Connect";
-          btn.classList.remove("disconnect");
-          btn.disabled = false;
-          muteBtn.classList.remove("visible", "muted");
-          isMuted = false;
-        };
+        return new Promise((resolve) => {
+          session.closeResolvers.push(resolve);
+          if (socket.readyState < WebSocket.CLOSING) socket.close();
+          setTimeout(resolve, 1500);
+        });
+      }
 
-        ws.onerror = () => {
-          setStatus("Connection error", "error");
+      function cleanup(session, closeSocket = false) {
+        if (closeSocket) previousSocketClosed = waitForSocketClose(session);
+        if (session.cleaned) return previousSocketClosed;
+        session.cleaned = true;
+
+        stopMeter(session);
+        if (session.processor) {
+          session.processor.onaudioprocess = null;
+          session.processor.disconnect();
+        }
+        session.source?.disconnect();
+        session.stream?.getTracks().forEach((track) => track.stop());
+        session.audioCtx?.close().catch(() => {});
+        session.wakeLock?.release().catch(() => {});
+        if (session.connectTimer) clearTimeout(session.connectTimer);
+        if (session.droppedFrames > 0)
+          console.warn(
+            `Dropped ${session.droppedFrames} audio frames to avoid latency`,
+          );
+
+        session.processor = null;
+        session.source = null;
+        session.analyser = null;
+        session.stream = null;
+        session.audioCtx = null;
+        session.wakeLock = null;
+        return previousSocketClosed;
+      }
+
+      function connect() {
+        if (currentSession) return;
+
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass) {
+          setStatus("Web Audio unavailable", "error");
+          return;
+        }
+
+        const session = {
+          id: ++nextSessionId,
+          socket: null,
+          stream: null,
+          audioCtx: new AudioContextClass({ sampleRate: SAMPLE_RATE }),
+          source: null,
+          processor: null,
+          analyser: null,
+          meterRaf: null,
+          wakeLock: null,
+          wakeLockRequest: null,
+          closeResolvers: [],
+          resampler: { position: 0, previous: 0 },
+          muted: false,
+          cleaned: false,
+          accepted: false,
+          droppedFrames: 0,
+          errorMessage: null,
+          connectTimer: null,
         };
+        currentSession = session;
+
+        btn.textContent = "Cancel";
+        btn.classList.add("disconnect");
+        btn.disabled = false;
+        setStatus("Connecting…", "connecting");
+        setDetails("Waiting for permission", "Connecting", "Requesting wake lock");
+        session.audioCtx.resume().catch(() => {});
+        requestWakeLock(session);
+
+        const priorClose = previousSocketClosed;
+        (async () => {
+          await priorClose;
+          if (!isCurrent(session)) return;
+
+          const socket = new WebSocket(wsUrl());
+          session.socket = socket;
+          socket.binaryType = "arraybuffer";
+          session.connectTimer = setTimeout(() => {
+            if (!isCurrent(session) || session.accepted) return;
+            session.errorMessage = "Computer did not respond";
+            setStatus(session.errorMessage, "error");
+            socket.close();
+          }, 8000);
+
+          socket.onmessage = async ({ data }) => {
+            if (typeof data !== "string" || !isCurrent(session)) return;
+            console.info("Server:", data);
+            if (data.startsWith("error:")) {
+              session.errorMessage = "Another device is already connected";
+              setStatus(session.errorMessage, "error");
+              socket.close();
+              return;
+            }
+            if (data !== "ok: connected" || session.accepted) return;
+
+            session.accepted = true;
+            clearTimeout(session.connectTimer);
+            session.connectTimer = null;
+            try {
+              await startAudio(session);
+              if (!isCurrent(session)) return;
+              setStatus("Streaming audio", "connected");
+              streamState.textContent = "Sending to computer";
+              btn.textContent = "Disconnect microphone";
+              btn.classList.add("disconnect");
+              btn.disabled = false;
+              muteBtn.classList.add("visible");
+            } catch (err) {
+              if (!isCurrent(session)) return;
+              session.errorMessage = friendlyAudioError(err);
+              setStatus(session.errorMessage, "error");
+              socket.close();
+            }
+          };
+
+          socket.onclose = () => {
+            session.closeResolvers.splice(0).forEach((resolve) => resolve());
+            cleanup(session);
+            if (currentSession !== session) return;
+            currentSession = null;
+            resetUi(
+              session.errorMessage
+                ? session.errorMessage
+                : "Ready",
+              session.errorMessage ? "error" : "",
+            );
+          };
+
+          socket.onerror = () => {
+            if (isCurrent(session)) setStatus("Could not reach computer", "error");
+          };
+        })().catch((err) => {
+          if (!isCurrent(session)) return;
+          session.errorMessage = err.message;
+          currentSession = null;
+          cleanup(session, true);
+          resetUi("Could not connect", "error");
+        });
+      }
+
+      function friendlyAudioError(err) {
+        if (err?.name === "NotAllowedError") return "Microphone permission denied";
+        if (err?.name === "NotFoundError") return "No microphone found";
+        if (err?.name === "NotReadableError") return "Microphone is busy";
+        return "Microphone unavailable";
       }
 
       function disconnect() {
-        ws?.close();
-        cleanup();
-      }
-
-      function cleanup() {
-        isMuted = false;
-        stopMeter();
-        processor?.disconnect();
-        processor = null;
-        audioCtx?.close();
-        audioCtx = null;
-        analyser = null;
-        stream?.getTracks().forEach((t) => t.stop());
-        stream = null;
-        ws = null;
+        const session = currentSession;
+        if (!session) return;
+        currentSession = null;
+        cleanup(session, true);
+        resetUi();
       }
 
       muteBtn.addEventListener("click", () => {
-        isMuted = !isMuted;
-        applyMuteVisuals();
+        const session = currentSession;
+        if (!session || !session.accepted) return;
+        session.muted = !session.muted;
+        if (!session.muted) session.resampler = { position: 0, previous: 0 };
+        applyMuteVisuals(session);
       });
 
       btn.addEventListener("click", () => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) connect();
-        else disconnect();
+        if (currentSession) disconnect();
+        else connect();
+      });
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible" && currentSession)
+          requestWakeLock(currentSession);
       });
     </script>
   </body>
