@@ -7,10 +7,63 @@ use tracing::{error, info, warn};
 const SOURCE_NAME: &str = "RemoteMic";
 const PIPE_FILE_NAME: &str = "remotemic.pipe";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampleFormat {
+    S16Le,
+    Float32Le,
+}
+
+impl SampleFormat {
+    pub const fn pulse_name(self) -> &'static str {
+        match self {
+            Self::S16Le => "s16le",
+            Self::Float32Le => "float32le",
+        }
+    }
+
+    pub const fn browser_name(self) -> &'static str {
+        match self {
+            Self::S16Le => "s16le",
+            Self::Float32Le => "float32le",
+        }
+    }
+
+    pub const fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::S16Le => 2,
+            Self::Float32Le => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioConfig {
+    pub sample_rate: u32,
+    pub sample_format: SampleFormat,
+}
+
+impl AudioConfig {
+    pub const LOW: Self = Self {
+        sample_rate: 16_000,
+        sample_format: SampleFormat::S16Le,
+    };
+
+    pub const STANDARD: Self = Self {
+        sample_rate: 44_100,
+        sample_format: SampleFormat::S16Le,
+    };
+
+    pub const HIGH: Self = Self {
+        sample_rate: 48_000,
+        sample_format: SampleFormat::Float32Le,
+    };
+}
+
 #[derive(Clone)]
 pub struct VirtualMic {
     state: Arc<Mutex<VirtualMicState>>,
     pipe_path: PathBuf,
+    config: AudioConfig,
 }
 
 #[derive(Default)]
@@ -23,10 +76,11 @@ enum VirtualMicState {
 }
 
 impl VirtualMic {
-    pub fn new() -> Self {
+    pub fn new(config: AudioConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(VirtualMicState::Unloaded)),
             pipe_path: default_pipe_path(),
+            config,
         }
     }
 
@@ -59,6 +113,8 @@ impl VirtualMic {
         info!("Loading PulseAudio module-pipe-source");
 
         let pipe_path = self.pipe_path.clone();
+        let format_arg = format!("format={}", self.config.sample_format.pulse_name());
+        let rate_arg = format!("rate={}", self.config.sample_rate);
         let output = tokio::task::spawn_blocking(move || {
             std::process::Command::new("pactl")
                 .args([
@@ -66,8 +122,8 @@ impl VirtualMic {
                     "module-pipe-source",
                     &format!("source_name={SOURCE_NAME}"),
                     &format!("file={}", pipe_path.display()),
-                    "format=s16le",
-                    "rate=44100",
+                    &format_arg,
+                    &rate_arg,
                     "channels=1",
                 ])
                 .output()
@@ -149,12 +205,6 @@ impl VirtualMic {
                 e
             ),
         }
-    }
-}
-
-impl Default for VirtualMic {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

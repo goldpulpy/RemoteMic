@@ -3,7 +3,7 @@ mod page;
 mod preflight;
 mod server;
 
-use audio::VirtualMic;
+use audio::{AudioConfig, VirtualMic};
 use server::{AudioFrame, Server, SessionRegistry};
 use std::path::PathBuf;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -20,13 +20,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let requested_port = match parse_port_arg() {
-        Ok(port) => port,
+    let options = match parse_args(std::env::args().skip(1)) {
+        Ok(options) => options,
         Err(msg) => {
-            error!("{msg}\nUsage: remotemic [-p <port>]");
+            error!("{msg}\n\n{}", usage());
             std::process::exit(1);
         }
     };
+    if options.help {
+        println!("{}", usage());
+        return Ok(());
+    }
 
     if let Err(msg) = preflight::check_pactl().await {
         error!("{msg}");
@@ -35,16 +39,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     preflight::check_audio_libs().await;
 
-    let virtual_mic = VirtualMic::new();
+    let audio_config = options.quality.audio_config();
+    info!(
+        "Audio quality: {} ({} Hz, {}, mono)",
+        options.quality.name(),
+        audio_config.sample_rate,
+        audio_config.sample_format.pulse_name()
+    );
+    let virtual_mic = VirtualMic::new(audio_config);
     virtual_mic.load().await?;
 
     let pipe_path = virtual_mic.pipe_path();
     let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(8);
 
-    let listener = bind_listener(requested_port).await?;
+    let listener = bind_listener(options.port).await?;
     let port = listener.local_addr()?.port();
     info!("RemoteMic starting on port {port}");
-    let server = Server::new(audio_tx);
+    let server = Server::new(audio_tx, audio_config);
 
     print_access_urls(port);
 
@@ -83,18 +94,89 @@ async fn bind_listener(port: Option<u16>) -> Result<tokio::net::TcpListener, std
     }
 }
 
-fn parse_port_arg() -> Result<Option<u16>, String> {
-    let args: Vec<String> = std::env::args().collect();
-    let Some(idx) = args.iter().position(|a| a == "-p" || a == "--port") else {
-        return Ok(None);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Quality {
+    Low,
+    Standard,
+    High,
+}
+
+impl Quality {
+    const fn audio_config(self) -> AudioConfig {
+        match self {
+            Self::Low => AudioConfig::LOW,
+            Self::Standard => AudioConfig::STANDARD,
+            Self::High => AudioConfig::HIGH,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Standard => "standard",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Options {
+    port: Option<u16>,
+    quality: Quality,
+    help: bool,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
+    let mut args = args.into_iter();
+    let mut options = Options {
+        port: None,
+        quality: Quality::Standard,
+        help: false,
     };
-    let value = args
-        .get(idx + 1)
-        .ok_or_else(|| "Missing value after -p/--port".to_string())?;
-    let port = value
-        .parse::<u16>()
-        .map_err(|_| format!("Invalid port \"{value}\": expected a number 0-65535"))?;
-    Ok(Some(port))
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-p" | "--port" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value after -p/--port".to_string())?;
+                options.port =
+                    Some(value.parse::<u16>().map_err(|_| {
+                        format!("Invalid port \"{value}\": expected a number 0-65535")
+                    })?);
+            }
+            "-q" | "--quality" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value after -q/--quality".to_string())?;
+                options.quality = match value.as_str() {
+                    "low" => Quality::Low,
+                    "standard" => Quality::Standard,
+                    "high" => Quality::High,
+                    _ => {
+                        return Err(format!(
+                            "Invalid quality \"{value}\": expected low, standard, or high"
+                        ));
+                    }
+                };
+            }
+            "-h" | "--help" => options.help = true,
+            _ => return Err(format!("Unknown argument \"{arg}\"")),
+        }
+    }
+
+    Ok(options)
+}
+
+fn usage() -> &'static str {
+    r#"Usage: remotemic [OPTIONS]
+
+Options:
+  -p, --port <PORT>          Listen on this port (default: random)
+  -q, --quality <QUALITY>    low: 16 kHz/16-bit
+                             standard: 44.1 kHz/16-bit (default)
+                             high: 48 kHz/32-bit float
+  -h, --help                 Print help"#
 }
 
 fn print_access_urls(port: u16) {
@@ -197,4 +279,54 @@ where
 
 async fn drain_channel(rx: &mut mpsc::Receiver<AudioFrame>) {
     while rx.try_recv().is_ok() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Options, Quality, parse_args};
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_to_current_audio_quality() {
+        assert_eq!(
+            parse_args(Vec::new()).unwrap(),
+            Options {
+                port: None,
+                quality: Quality::Standard,
+                help: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_high_quality_and_port() {
+        assert_eq!(
+            parse_args(strings(&["--quality", "high", "--port", "9000"])).unwrap(),
+            Options {
+                port: Some(9000),
+                quality: Quality::High,
+                help: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_low_quality() {
+        assert_eq!(
+            parse_args(strings(&["-q", "low"])).unwrap(),
+            Options {
+                port: None,
+                quality: Quality::Low,
+                help: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_quality() {
+        assert!(parse_args(strings(&["--quality", "lossless"])).is_err());
+    }
 }

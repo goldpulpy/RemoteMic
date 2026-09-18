@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::page;
+use crate::{audio::AudioConfig, page};
 
 const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 const ACQUIRE_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -28,6 +28,7 @@ pub struct Server {
     audio_tx: mpsc::Sender<AudioFrame>,
     sessions: SessionRegistry,
     token: Arc<str>,
+    audio_config: AudioConfig,
 }
 
 pub struct AudioFrame {
@@ -75,7 +76,7 @@ impl SessionRegistry {
 }
 
 impl Server {
-    pub fn new(audio_tx: mpsc::Sender<AudioFrame>) -> Self {
+    pub fn new(audio_tx: mpsc::Sender<AudioFrame>, audio_config: AudioConfig) -> Self {
         let token = format!(
             "{:016x}{:016x}",
             rand::random::<u64>(),
@@ -86,6 +87,7 @@ impl Server {
             audio_tx,
             sessions: SessionRegistry::default(),
             token: Arc::from(token),
+            audio_config,
         }
     }
 
@@ -106,7 +108,24 @@ impl Server {
 // ---------------------------------------------------------------------------
 
 async fn index_handler(State(state): State<Server>) -> Html<String> {
-    Html(page::HTML.replace("__REMOTEMIC_TOKEN__", &state.token))
+    Html(render_page(&state.token, state.audio_config))
+}
+
+fn render_page(token: &str, audio_config: AudioConfig) -> String {
+    page::HTML
+        .replace("__REMOTEMIC_TOKEN__", token)
+        .replace(
+            "__REMOTEMIC_SAMPLE_RATE__",
+            &audio_config.sample_rate.to_string(),
+        )
+        .replace(
+            "__REMOTEMIC_SAMPLE_FORMAT__",
+            audio_config.sample_format.browser_name(),
+        )
+        .replace(
+            "__REMOTEMIC_BYTES_PER_SAMPLE__",
+            &audio_config.sample_format.bytes_per_sample().to_string(),
+        )
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Server>, uri: Uri) -> Response {
@@ -195,7 +214,8 @@ async fn handle_socket(socket: WebSocket, state: Server) {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionRegistry;
+    use super::{SessionRegistry, render_page};
+    use crate::audio::AudioConfig;
 
     #[tokio::test]
     async fn stale_release_cannot_clear_a_new_session() {
@@ -208,5 +228,25 @@ mod tests {
 
         assert!(sessions.is_active(second));
         assert!(sessions.acquire().await.is_none());
+    }
+
+    #[test]
+    fn high_quality_page_uses_matching_wire_format() {
+        let html = render_page("test-token", AudioConfig::HIGH);
+
+        assert!(html.contains("const SAMPLE_RATE = 48000;"));
+        assert!(html.contains("const SAMPLE_FORMAT = \"float32le\";"));
+        assert!(html.contains("const BYTES_PER_SAMPLE = 4;"));
+        assert!(!html.contains("__REMOTEMIC_"));
+    }
+
+    #[test]
+    fn low_quality_page_uses_matching_wire_format() {
+        let html = render_page("test-token", AudioConfig::LOW);
+
+        assert!(html.contains("const SAMPLE_RATE = 16000;"));
+        assert!(html.contains("const SAMPLE_FORMAT = \"s16le\";"));
+        assert!(html.contains("const BYTES_PER_SAMPLE = 2;"));
+        assert!(!html.contains("__REMOTEMIC_"));
     }
 }

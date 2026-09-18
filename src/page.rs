@@ -565,9 +565,11 @@ pub const HTML: &str = r#"
       const barsEl = document.getElementById("bars");
       const barSpans = barsEl.querySelectorAll("span");
 
-      const SAMPLE_RATE = 44100;
-      const BUFFER_SIZE = 4096;
-      const MAX_BUFFERED_BYTES = BUFFER_SIZE * 2 * 4;
+      const SAMPLE_RATE = __REMOTEMIC_SAMPLE_RATE__;
+      const SAMPLE_FORMAT = "__REMOTEMIC_SAMPLE_FORMAT__";
+      const BYTES_PER_SAMPLE = __REMOTEMIC_BYTES_PER_SAMPLE__;
+      const BUFFER_SIZE = SAMPLE_RATE <= 16000 ? 1024 : 4096;
+      const MAX_BUFFERED_BYTES = BUFFER_SIZE * BYTES_PER_SAMPLE * 4;
       const TOKEN = "__REMOTEMIC_TOKEN__";
 
       let currentSession = null;
@@ -714,12 +716,16 @@ pub const HTML: &str = r#"
 
           const f32 = ev.inputBuffer.getChannelData(0);
           const pcm = resample(f32, audioCtx.sampleRate, session.resampler);
-          const buffer = new ArrayBuffer(pcm.length * 2);
+          const buffer = new ArrayBuffer(pcm.length * BYTES_PER_SAMPLE);
           const view = new DataView(buffer);
           for (let i = 0; i < pcm.length; i++) {
             const c = Math.max(-1, Math.min(1, pcm[i]));
-            const sample = c < 0 ? c * 0x8000 : c * 0x7fff;
-            view.setInt16(i * 2, sample, true);
+            if (SAMPLE_FORMAT === "float32le") {
+              view.setFloat32(i * 4, c, true);
+            } else {
+              const sample = c < 0 ? c * 0x8000 : c * 0x7fff;
+              view.setInt16(i * 2, sample, true);
+            }
           }
           socket.send(buffer);
         };
