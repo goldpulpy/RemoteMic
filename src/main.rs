@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    preflight::check_audio_libs();
+    preflight::check_audio_libs().await;
 
     let virtual_mic = VirtualMic::new();
     virtual_mic.load().await?;

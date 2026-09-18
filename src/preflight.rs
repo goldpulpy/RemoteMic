@@ -1,35 +1,31 @@
-use std::path::Path;
+use std::path::PathBuf;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-async fn which(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 pub async fn check_pactl() -> Result<(), String> {
-    if which("pactl").await {
-        info!("pactl: OK");
-        Ok(())
-    } else {
-        Err("pactl not found. Install PulseAudio or PipeWire-pulse:\n  \
+    match Command::new("pactl").arg("--version").output().await {
+        Ok(_) => {
+            info!("pactl: OK");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err("pactl not found. Install PulseAudio or PipeWire-pulse:\n  \
              Debian/Ubuntu: sudo apt install pulseaudio-utils\n  \
              Fedora:        sudo dnf install pulseaudio-utils\n  \
              Arch:          sudo pacman -S libpulse"
-            .to_string())
+                .to_string())
+        }
+        Err(e) => Err(format!("pactl could not be executed: {e}")),
     }
 }
 
-pub fn check_audio_libs() {
+pub async fn check_audio_libs() {
     let required: &[&str] = &["libpulse.so.0", "libasound.so.2"];
     let optional: &[&str] = &["libpipewire-0.3.so.0"];
+    let cache = ldconfig_cache().await;
 
     for lib in required {
-        if lib_exists(lib) {
+        if lib_available(lib, cache.as_deref()) {
             info!("lib {lib}: OK");
         } else {
             warn!(
@@ -42,7 +38,7 @@ pub fn check_audio_libs() {
     }
 
     for lib in optional {
-        if lib_exists(lib) {
+        if lib_available(lib, cache.as_deref()) {
             info!("lib {lib}: OK (PipeWire native)");
         } else {
             info!("lib {lib}: not found (optional, PipeWire native support disabled)");
@@ -50,18 +46,49 @@ pub fn check_audio_libs() {
     }
 }
 
-fn lib_exists(name: &str) -> bool {
-    let search_paths = [
-        "/usr/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/lib64",
-        "/usr/local/lib",
-        "/lib",
-        "/lib/x86_64-linux-gnu",
-        "/lib64",
-    ];
-    search_paths
-        .iter()
-        .any(|dir| Path::new(dir).join(name).exists())
+async fn ldconfig_cache() -> Option<String> {
+    let output = Command::new("ldconfig").arg("-p").output().await.ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn lib_available(name: &str, cache: Option<&str>) -> bool {
+    if let Some(cache) = cache
+        && cache.lines().any(|line| line.contains(name))
+    {
+        return true;
+    }
+
+    lib_exists_in_paths(name)
+}
+
+fn lib_exists_in_paths(name: &str) -> bool {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
+        dirs.extend(std::env::split_paths(&paths));
+    }
+
+    dirs.extend(
+        [
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/local/lib",
+            "/lib",
+            "/lib64",
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/lib/aarch64-linux-gnu",
+            "/usr/lib/arm-linux-gnueabihf",
+            "/lib/arm-linux-gnueabihf",
+            "/run/current-system/sw/lib",
+            "/nix/var/nix/profiles/default/lib",
+        ]
+        .map(PathBuf::from),
+    );
+
+    dirs.iter().any(|dir| dir.join(name).exists())
 }
