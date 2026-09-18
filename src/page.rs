@@ -531,15 +531,15 @@ pub const HTML: &str = r#"
           </div>
           <div class="fact">
             <span class="fact-label">RTT</span>
-            <span class="fact-value" id="rtt-state">—</span>
+            <span class="fact-value" id="rtt-state">-</span>
           </div>
           <div class="fact">
             <span class="fact-label">Network</span>
-            <span class="fact-value" id="network-state">—</span>
+            <span class="fact-value" id="network-state">-</span>
           </div>
           <div class="fact">
             <span class="fact-label">Queue</span>
-            <span class="fact-value" id="queue-state">—</span>
+            <span class="fact-value" id="queue-state">-</span>
           </div>
         </div>
       </div>
@@ -967,9 +967,9 @@ pub const HTML: &str = r#"
         micState.textContent = "Off";
         streamState.textContent = "Not sending";
         wakeState.textContent = "Managed when connected";
-        rttState.textContent = "—";
-        networkState.textContent = "—";
-        queueState.textContent = "—";
+        rttState.textContent = "-";
+        networkState.textContent = "-";
+        queueState.textContent = "-";
         setBadge(reason, failed ? "error" : "");
       }
 
