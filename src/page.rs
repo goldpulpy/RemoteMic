@@ -645,7 +645,7 @@ pub const HTML: &str = r#"
           barsEl.classList.add("muted");
           meterFill.classList.add("muted");
           setStatus("Muted", "muted");
-          setDetails("Muted", "Paused — still connected", wakeState.textContent);
+          setDetails("Muted", "Paused - still connected", wakeState.textContent);
         } else {
           muteBtn.innerHTML = "";
           const svg = document.createElementNS(

@@ -185,7 +185,7 @@ async fn handle_socket(socket: WebSocket, state: Server) {
     let (mut sender, mut receiver) = socket.split();
 
     let Some(session_id) = state.sessions.acquire().await else {
-        warn!("Rejecting new connection — another client is already streaming");
+        warn!("Rejecting new connection - another client is already streaming");
         let _ = sender
             .send(Message::Text(
                 "error: another client is already connected".into(),

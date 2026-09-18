@@ -29,7 +29,7 @@ RemoteMic has three quality presets:
 | `high`     |   48,000 Hz | 32-bit float little-endian PCM  |        1 |    192 kB/s | video, music, editing      |
 
 <details>
-<summary><strong>What these formats mean and what “high quality” guarantees</strong></summary>
+<summary><strong>What these formats mean and what "high quality" guarantees</strong></summary>
 
 Payload figures exclude WebSocket, TLS, and tunnel overhead. All modes are
 mono because browser microphone capture commonly exposes a single channel.
@@ -311,7 +311,7 @@ Microphone capture is restricted to secure browser contexts. A public tunnel
 is one convenient way to obtain an HTTPS URL. Choose one of the options below.
 
 <details open>
-<summary><strong>LocalTunnel — quickest option with Node.js</strong></summary>
+<summary><strong>LocalTunnel - quickest option with Node.js</strong></summary>
 
 LocalTunnel is convenient when Node.js and npm are already installed. It does
 not require an account for a temporary randomly assigned URL:
@@ -328,7 +328,7 @@ for installation and optional subdomain settings.
 </details>
 
 <details>
-<summary><strong>Cloudflare Quick Tunnel — no account or domain required</strong></summary>
+<summary><strong>Cloudflare Quick Tunnel - no account or domain required</strong></summary>
 
 After installing `cloudflared`, a temporary Quick Tunnel can be started without
 a Cloudflare account or domain:
@@ -346,7 +346,7 @@ create a managed Cloudflare Tunnel and map a domain to
 </details>
 
 <details>
-<summary><strong>ngrok — managed endpoints and access controls</strong></summary>
+<summary><strong>ngrok - managed endpoints and access controls</strong></summary>
 
 ngrok requires installing its agent, creating an account, and adding the
 account's authtoken once:
@@ -638,4 +638,4 @@ quality presets fit within that limit.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT License - see [LICENSE](LICENSE).
