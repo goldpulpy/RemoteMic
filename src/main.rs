@@ -2,20 +2,25 @@ mod audio;
 mod page;
 mod preflight;
 mod server;
+mod tls;
 
 use audio::{AudioConfig, InstanceLock, VirtualMic};
-use server::{AudioFrame, Server, SessionRegistry};
+use nix::ifaddrs::getifaddrs;
+use nix::net::if_::InterfaceFlags;
+use server::{AudioFrameReceiver, Server, SessionRegistry, StreamMetrics, audio_frame_channel};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::unix::pipe;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 use tracing_subscriber::filter::LevelFilter;
 
-const DEFAULT_QUEUE_SIZE: usize = 8;
+const DEFAULT_QUEUE_SIZE: usize = 1;
 const MAX_QUEUE_SIZE: usize = 1_024;
+const LOW_LATENCY_PIPE_SIZE_BYTES: i32 = 4_096;
+const CONTAINER_RANK: u8 = 3;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -98,26 +103,46 @@ async fn run_service(
     audio_config: AudioConfig,
     pipe_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(options.queue_size);
+    let (audio_tx, audio_rx) = audio_frame_channel(options.queue_size);
 
     let listener = bind_listener(options.bind, options.port).await?;
     let listen_addr = listener.local_addr()?;
     let port = listen_addr.port();
+    let advertised_ips = advertised_addresses(listen_addr.ip())?;
+    let certificate_dir = pipe_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("audio pipe has no parent directory"))?;
+    let local_tls = tls::prepare(certificate_dir, &advertised_ips)
+        .await
+        .map_err(std::io::Error::other)?;
     info!("RemoteMic starting on {listen_addr}");
     info!(
         "Virtual source: {} (audio queue: {} frames)",
         options.source_name, options.queue_size
     );
-    let server = Server::new(audio_tx, audio_config);
+    let server = Server::new(audio_tx, audio_config, local_tls.ca_der);
 
-    print_access_urls(listen_addr.ip(), port);
+    print_access_urls(&advertised_ips, port, &local_tls.ca_path);
 
-    let writer = tokio::spawn(audio_writer_loop(pipe_path, audio_rx, server.sessions()));
+    let writer = tokio::spawn(audio_writer_loop(
+        pipe_path,
+        audio_rx,
+        server.sessions(),
+        server.metrics(),
+    ));
     let app = server.router();
 
-    debug!("HTTP and WebSocket router ready; entering server loop");
-    let server_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    debug!("HTTPS/WebRTC signaling router ready; entering server loop");
+    let std_listener = listener.into_std()?;
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(3)));
+    });
+    let server_result = axum_server::from_tcp_rustls(std_listener, local_tls.config)?
+        .handle(handle)
+        .serve(app.into_make_service())
         .await;
 
     debug!("Stopping audio writer task");
@@ -309,34 +334,133 @@ Options:
   -b, --bind <ADDRESS>       Bind to this IP address (default: 0.0.0.0)
   -p, --port <PORT>          Listen on this port (default: random)
   -q, --quality <QUALITY>    low: 16 kHz/16-bit
-                             standard: 44.1 kHz/16-bit (default)
+                             standard: 24 kHz/16-bit (default)
                              high: 48 kHz/32-bit float
   -n, --source-name <NAME>   PulseAudio source name (default: RemoteMic)
-      --queue-size <FRAMES>  Buffered audio frames, 1-1024 (default: 8)
+      --queue-size <FRAMES>  Buffered audio frames, 1-1024 (default: 1)
   -l, --log-level <LEVEL>    error, warn, info, debug, or trace (default: info)
   -h, --help                 Print help
   -V, --version              Print version"#
 }
 
-fn print_access_urls(address: IpAddr, port: u16) {
-    let connect_address = connect_address(address);
-    let url_host = url_host(connect_address);
-
-    info!("Open http://{url_host}:{port}");
+fn print_access_urls(addresses: &[IpAddr], port: u16, ca_path: &std::path::Path) {
+    for address in addresses {
+        info!("Open https://{}:{port}", url_host(*address));
+    }
     info!(
-        "NOTE: Microphone access requires HTTPS on non-localhost origins. \
-             If the mic does not work, run: npx localtunnel --port {port} \
-             --local-host {connect_address}"
+        "Install the local CA on the sending device once: {}",
+        ca_path.display()
     );
+    info!("Enable full trust for RemoteMic Local CA in the device certificate settings");
 }
 
-fn connect_address(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V4(address) if address.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(address) if address.is_unspecified() => {
-            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+fn advertised_addresses(bind: IpAddr) -> Result<Vec<IpAddr>, std::io::Error> {
+    match bind {
+        IpAddr::V4(address) if address.is_unspecified() => {
+            let mut addresses = global_ipv4_addresses();
+            if addresses.is_empty() {
+                addresses.push(advertised_address(IpAddr::V4(address))?);
+            }
+            Ok(addresses)
         }
-        address => address,
+        address => Ok(vec![advertised_address(address)?]),
+    }
+}
+
+fn global_ipv4_addresses() -> Vec<IpAddr> {
+    let Ok(interfaces) = getifaddrs() else {
+        return Vec::new();
+    };
+
+    let mut candidates: Vec<(u8, IpAddr)> = Vec::new();
+    for interface in interfaces {
+        if !interface.flags.contains(InterfaceFlags::IFF_UP) {
+            continue;
+        }
+        let rank = interface_rank(&interface.interface_name);
+        if rank == CONTAINER_RANK {
+            continue;
+        }
+        let Some(storage) = interface.address.as_ref() else {
+            continue;
+        };
+        let Some(inet) = storage.as_sockaddr_in() else {
+            continue;
+        };
+        let address = IpAddr::V4(inet.ip());
+        if !usable_ipv4(address) {
+            continue;
+        }
+        candidates.push((rank, address));
+    }
+
+    candidates.sort_by_key(|(rank, address)| (*rank, address.to_string()));
+    candidates.dedup_by(|a, b| a.1 == b.1);
+    let Some(best_rank) = candidates.first().map(|(rank, _)| *rank) else {
+        return Vec::new();
+    };
+    candidates
+        .into_iter()
+        .filter(|(rank, _)| *rank == best_rank)
+        .map(|(_, address)| address)
+        .collect()
+}
+
+fn usable_ipv4(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_link_local()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn interface_rank(name: &str) -> u8 {
+    if name.starts_with("docker")
+        || name.starts_with("veth")
+        || name.starts_with("br-")
+        || name.starts_with("virbr")
+        || name.starts_with("vmnet")
+        || name.starts_with("vboxnet")
+    {
+        CONTAINER_RANK
+    } else if name.starts_with("tun")
+        || name.starts_with("tap")
+        || name.starts_with("wg")
+        || name.starts_with("tailscale")
+        || name.starts_with("zt")
+        || name.starts_with("utun")
+    {
+        2
+    } else if name.starts_with("wl")
+        || name.starts_with("en")
+        || name.starts_with("eth")
+        || name.starts_with("ww")
+        || name.starts_with("usb")
+    {
+        0
+    } else {
+        1
+    }
+}
+
+fn advertised_address(address: IpAddr) -> Result<IpAddr, std::io::Error> {
+    match address {
+        IpAddr::V4(address) if address.is_unspecified() => {
+            let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+            socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+            Ok(socket.local_addr()?.ip())
+        }
+        IpAddr::V6(address) if address.is_unspecified() => {
+            let socket = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))?;
+            socket.connect((std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9))?;
+            Ok(socket.local_addr()?.ip())
+        }
+        address => Ok(address),
     }
 }
 
@@ -379,17 +503,15 @@ async fn shutdown_signal() {
 
 async fn audio_writer_loop(
     path: PathBuf,
-    mut rx: mpsc::Receiver<AudioFrame>,
+    rx: AudioFrameReceiver,
     sessions: SessionRegistry,
+    metrics: StreamMetrics,
 ) {
     info!("Audio writer ready, waiting for data on {}", path.display());
     let mut stale_frames = 0_u64;
 
     loop {
-        let first = match rx.recv().await {
-            Some(d) => d,
-            None => return,
-        };
+        let first = rx.recv().await;
 
         if !sessions.is_active(first.session_id) {
             stale_frames += 1;
@@ -399,13 +521,14 @@ async fn audio_writer_loop(
             );
             continue;
         }
+        metrics.record_queue_delay(first.enqueued_at.elapsed());
 
         debug!(session_id = first.session_id, "Opening audio pipe");
         let mut writer = match pipe::OpenOptions::new().read_write(true).open_sender(&path) {
             Ok(writer) => writer,
             Err(e) => {
                 error!("Failed to open pipe for writing: {e}");
-                let drained = drain_channel(&mut rx);
+                let drained = rx.drain();
                 debug!(
                     drained_frames = drained,
                     "Drained audio queue after pipe error"
@@ -413,6 +536,7 @@ async fn audio_writer_loop(
                 continue;
             }
         };
+        limit_pipe_buffer(&writer);
 
         info!("Pipe opened, streaming audio");
 
@@ -428,43 +552,37 @@ async fn audio_writer_loop(
         );
 
         loop {
-            match rx.recv().await {
-                Some(frame) => {
-                    if !sessions.is_active(frame.session_id) {
-                        stale_frames += 1;
-                        trace!(
-                            session_id = frame.session_id,
-                            stale_frames, "Discarding frame from inactive session"
-                        );
-                        continue;
-                    }
-                    if write_chunk(&mut writer, &frame.data).await.is_err() {
-                        debug!(
-                            session_id = frame.session_id,
-                            written_frames, written_bytes, "Audio pipe stream interrupted"
-                        );
-                        break;
-                    }
-                    written_frames += 1;
-                    written_bytes += frame.data.len() as u64;
-                    trace!(
-                        session_id = frame.session_id,
-                        bytes = frame.data.len(),
-                        written_frames,
-                        written_bytes,
-                        "Wrote audio frame"
-                    );
-                    if written_frames.is_multiple_of(256) {
-                        debug!(
-                            session_id = frame.session_id,
-                            written_frames, written_bytes, "Audio pipe streaming progress"
-                        );
-                    }
-                }
-                None => {
-                    info!("Audio channel closed, writer exiting");
-                    return;
-                }
+            let frame = rx.recv().await;
+            if !sessions.is_active(frame.session_id) {
+                stale_frames += 1;
+                trace!(
+                    session_id = frame.session_id,
+                    stale_frames, "Discarding frame from inactive session"
+                );
+                continue;
+            }
+            metrics.record_queue_delay(frame.enqueued_at.elapsed());
+            if write_chunk(&mut writer, &frame.data).await.is_err() {
+                debug!(
+                    session_id = frame.session_id,
+                    written_frames, written_bytes, "Audio pipe stream interrupted"
+                );
+                break;
+            }
+            written_frames += 1;
+            written_bytes += frame.data.len() as u64;
+            trace!(
+                session_id = frame.session_id,
+                bytes = frame.data.len(),
+                written_frames,
+                written_bytes,
+                "Wrote audio frame"
+            );
+            if written_frames.is_multiple_of(256) {
+                debug!(
+                    session_id = frame.session_id,
+                    written_frames, written_bytes, "Audio pipe streaming progress"
+                );
             }
         }
     }
@@ -479,17 +597,21 @@ where
     })
 }
 
-fn drain_channel(rx: &mut mpsc::Receiver<AudioFrame>) -> usize {
-    let mut drained = 0;
-    while rx.try_recv().is_ok() {
-        drained += 1;
+fn limit_pipe_buffer(writer: &pipe::Sender) {
+    use nix::fcntl::{FcntlArg, fcntl};
+
+    match fcntl(writer, FcntlArg::F_SETPIPE_SZ(LOW_LATENCY_PIPE_SIZE_BYTES)) {
+        Ok(actual_size) => debug!(actual_size, "Limited audio FIFO buffer"),
+        Err(error) => warn!(%error, "Could not limit audio FIFO buffer"),
     }
-    drained
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_QUEUE_SIZE, Options, Quality, connect_address, parse_args, url_host};
+    use super::{
+        DEFAULT_QUEUE_SIZE, Options, Quality, advertised_addresses, interface_rank, parse_args,
+        url_host, usable_ipv4,
+    };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use tracing_subscriber::filter::LevelFilter;
 
@@ -581,26 +703,24 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_ipv4_advertises_ipv4_loopback() {
-        assert_eq!(
-            connect_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
-    }
-
-    #[test]
-    fn unspecified_ipv6_advertises_ipv6_loopback() {
-        assert_eq!(
-            connect_address(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
-            IpAddr::V6(Ipv6Addr::LOCALHOST)
-        );
-    }
-
-    #[test]
     fn concrete_bind_address_is_advertised_unchanged() {
         let address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
 
-        assert_eq!(connect_address(address), address);
+        assert_eq!(advertised_addresses(address).unwrap(), vec![address]);
+    }
+
+    #[test]
+    fn physical_interfaces_rank_before_vpn_and_container_interfaces() {
+        assert!(interface_rank("wlan0") < interface_rank("tun0"));
+        assert!(interface_rank("eth0") < interface_rank("tailscale0"));
+        assert!(interface_rank("tun0") < interface_rank("docker0"));
+    }
+
+    #[test]
+    fn loopback_and_link_local_are_not_advertisable() {
+        assert!(!usable_ipv4(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!usable_ipv4(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))));
+        assert!(usable_ipv4(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2))));
     }
 
     #[test]

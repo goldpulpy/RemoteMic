@@ -21,20 +21,6 @@ impl SampleFormat {
         }
     }
 
-    pub const fn browser_name(self) -> &'static str {
-        match self {
-            Self::S16Le => "s16le",
-            Self::Float32Le => "float32le",
-        }
-    }
-
-    pub const fn bytes_per_sample(self) -> usize {
-        match self {
-            Self::S16Le => 2,
-            Self::Float32Le => 4,
-        }
-    }
-
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::S16Le => "16-bit PCM",
@@ -47,22 +33,26 @@ impl SampleFormat {
 pub struct AudioConfig {
     pub sample_rate: u32,
     pub sample_format: SampleFormat,
+    pub opus_bitrate: u32,
 }
 
 impl AudioConfig {
     pub const LOW: Self = Self {
         sample_rate: 16_000,
         sample_format: SampleFormat::S16Le,
+        opus_bitrate: 48_000,
     };
 
     pub const STANDARD: Self = Self {
-        sample_rate: 44_100,
+        sample_rate: 24_000,
         sample_format: SampleFormat::S16Le,
+        opus_bitrate: 96_000,
     };
 
     pub const HIGH: Self = Self {
         sample_rate: 48_000,
         sample_format: SampleFormat::Float32Le,
+        opus_bitrate: 192_000,
     };
 }
 

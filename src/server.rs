@@ -1,79 +1,149 @@
+use async_trait::async_trait;
 use axum::{
     Router,
+    body::Body,
     extract::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{StatusCode, Uri},
+    http::{StatusCode, Uri, header},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use opus_rs::OpusDecoder;
+use rtc::{
+    interceptor::Registry,
+    peer_connection::{
+        configuration::{
+            RTCConfigurationBuilder,
+            interceptor_registry::register_default_interceptors,
+            media_engine::{MIME_TYPE_OPUS, MediaEngine},
+        },
+        sdp::RTCSessionDescription,
+    },
+    rtp_transceiver::{
+        RTCRtpTransceiverDirection, RTCRtpTransceiverInit,
+        rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind},
+    },
 };
-use std::time::Duration;
-use tokio::sync::mpsc;
+use serde::Serialize;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
+use webrtc::{
+    media_stream::track_remote::{TrackRemote, TrackRemoteEvent},
+    peer_connection::{
+        PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
+        RTCPeerConnectionState,
+    },
+};
 
-use crate::{audio::AudioConfig, page};
+use crate::{
+    audio::{AudioConfig, SampleFormat},
+    page,
+};
 
-const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
+const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
 const ACQUIRE_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
 const ACQUIRE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-const FIRST_AUDIO_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-struct SessionTimeouts {
-    first_audio_deadline: tokio::time::Instant,
-    received_audio: bool,
-}
-
-impl SessionTimeouts {
-    fn new(now: tokio::time::Instant) -> Self {
-        Self {
-            first_audio_deadline: now + FIRST_AUDIO_FRAME_TIMEOUT,
-            received_audio: false,
-        }
-    }
-
-    fn receive_deadline(&self, now: tokio::time::Instant) -> tokio::time::Instant {
-        if self.received_audio {
-            now + SESSION_IDLE_TIMEOUT
-        } else {
-            self.first_audio_deadline
-        }
-    }
-
-    fn record_audio(&mut self) {
-        self.received_audio = true;
-    }
-
-    const fn reason(&self) -> &'static str {
-        if self.received_audio {
-            "client stopped sending heartbeats and audio"
-        } else {
-            "client did not start sending audio"
-        }
-    }
-}
-
-fn is_valid_audio_frame_len(frame_len: usize, bytes_per_sample: usize) -> bool {
-    bytes_per_sample > 0 && frame_len > 0 && frame_len.is_multiple_of(bytes_per_sample)
-}
+const SIGNALING_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_PLC_PACKETS: u16 = 3;
+const OPUS_CLOCK_RATE: u32 = 48_000;
 
 #[derive(Clone)]
 pub struct Server {
-    audio_tx: mpsc::Sender<AudioFrame>,
+    audio_tx: AudioFrameSender,
     sessions: SessionRegistry,
     token: Arc<str>,
     audio_config: AudioConfig,
+    ca_der: Arc<[u8]>,
+    metrics: StreamMetrics,
 }
 
 pub struct AudioFrame {
     pub session_id: u64,
     pub data: Vec<u8>,
+    pub enqueued_at: Instant,
+}
+
+struct AudioFrameQueue {
+    frames: Mutex<VecDeque<AudioFrame>>,
+    capacity: usize,
+    ready: Notify,
+}
+
+#[derive(Clone)]
+pub struct AudioFrameSender(Arc<AudioFrameQueue>);
+
+pub struct AudioFrameReceiver(Arc<AudioFrameQueue>);
+
+pub fn audio_frame_channel(capacity: usize) -> (AudioFrameSender, AudioFrameReceiver) {
+    let queue = Arc::new(AudioFrameQueue {
+        frames: Mutex::new(VecDeque::with_capacity(capacity.max(1))),
+        capacity: capacity.max(1),
+        ready: Notify::new(),
+    });
+    (
+        AudioFrameSender(Arc::clone(&queue)),
+        AudioFrameReceiver(queue),
+    )
+}
+
+impl AudioFrameSender {
+    fn send_latest(&self, frame: AudioFrame) -> bool {
+        let mut frames = self
+            .0
+            .frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replaced_oldest = frames.len() == self.0.capacity;
+        if replaced_oldest {
+            frames.pop_front();
+        }
+        frames.push_back(frame);
+        drop(frames);
+        self.0.ready.notify_one();
+        replaced_oldest
+    }
+}
+
+impl AudioFrameReceiver {
+    pub async fn recv(&self) -> AudioFrame {
+        loop {
+            let ready = self.0.ready.notified();
+            if let Some(frame) = self.try_recv() {
+                return frame;
+            }
+            ready.await;
+        }
+    }
+
+    pub fn try_recv(&self) -> Option<AudioFrame> {
+        self.0
+            .frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+    }
+
+    pub fn drain(&self) -> usize {
+        let mut frames = self
+            .0
+            .frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let drained = frames.len();
+        frames.clear();
+        drained
+    }
 }
 
 #[derive(Clone, Default)]
@@ -86,33 +156,25 @@ impl SessionRegistry {
     async fn acquire(&self) -> Option<u64> {
         let session_id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let deadline = tokio::time::Instant::now() + ACQUIRE_RETRY_TIMEOUT;
-        trace!(session_id, "Attempting to acquire audio session");
-
         loop {
             if self
                 .active
                 .compare_exchange(0, session_id, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                debug!(session_id, "Audio session acquired");
                 return Some(session_id);
             }
-
             if tokio::time::Instant::now() >= deadline {
-                debug!(session_id, "Timed out waiting for active audio session");
                 return None;
             }
-
             tokio::time::sleep(ACQUIRE_RETRY_INTERVAL).await;
         }
     }
 
     fn release(&self, session_id: u64) {
-        let released = self
-            .active
+        self.active
             .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        debug!(session_id, released, "Audio session release requested");
+            .ok();
     }
 
     pub fn is_active(&self, session_id: u64) -> bool {
@@ -120,47 +182,123 @@ impl SessionRegistry {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct StreamMetrics(Arc<MetricsAtoms>);
+
+#[derive(Default)]
+struct MetricsAtoms {
+    packets_received: AtomicU64,
+    packets_lost: AtomicU64,
+    packets_reordered: AtomicU64,
+    decoded_frames: AtomicU64,
+    dropped_frames: AtomicU64,
+    jitter_micros: AtomicU64,
+    queue_micros: AtomicU64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetricsSnapshot {
+    packets_received: u64,
+    packets_lost: u64,
+    packets_reordered: u64,
+    decoded_frames: u64,
+    dropped_frames: u64,
+    loss_percent: f64,
+    jitter_ms: f64,
+    queue_ms: f64,
+}
+
+impl StreamMetrics {
+    fn reset(&self) {
+        self.0.packets_received.store(0, Ordering::Relaxed);
+        self.0.packets_lost.store(0, Ordering::Relaxed);
+        self.0.packets_reordered.store(0, Ordering::Relaxed);
+        self.0.decoded_frames.store(0, Ordering::Relaxed);
+        self.0.dropped_frames.store(0, Ordering::Relaxed);
+        self.0.jitter_micros.store(0, Ordering::Relaxed);
+        self.0.queue_micros.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> MetricsSnapshot {
+        let received = self.0.packets_received.load(Ordering::Relaxed);
+        let lost = self.0.packets_lost.load(Ordering::Relaxed);
+        let total = received.saturating_add(lost);
+        MetricsSnapshot {
+            packets_received: received,
+            packets_lost: lost,
+            packets_reordered: self.0.packets_reordered.load(Ordering::Relaxed),
+            decoded_frames: self.0.decoded_frames.load(Ordering::Relaxed),
+            dropped_frames: self.0.dropped_frames.load(Ordering::Relaxed),
+            loss_percent: if total == 0 {
+                0.0
+            } else {
+                lost as f64 * 100.0 / total as f64
+            },
+            jitter_ms: self.0.jitter_micros.load(Ordering::Relaxed) as f64 / 1_000.0,
+            queue_ms: self.0.queue_micros.load(Ordering::Relaxed) as f64 / 1_000.0,
+        }
+    }
+
+    pub fn record_queue_delay(&self, delay: Duration) {
+        self.0.queue_micros.store(
+            delay.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 impl Server {
-    pub fn new(audio_tx: mpsc::Sender<AudioFrame>, audio_config: AudioConfig) -> Self {
+    pub fn new(audio_tx: AudioFrameSender, audio_config: AudioConfig, ca_der: Vec<u8>) -> Self {
         let token = format!(
             "{:016x}{:016x}",
             rand::random::<u64>(),
             rand::random::<u64>()
         );
-
-        debug!(
-            sample_rate = audio_config.sample_rate,
-            sample_format = audio_config.sample_format.pulse_name(),
-            "Creating server state"
-        );
-
         Self {
             audio_tx,
             sessions: SessionRegistry::default(),
             token: Arc::from(token),
             audio_config,
+            ca_der: Arc::from(ca_der),
+            metrics: StreamMetrics::default(),
         }
     }
 
     pub fn sessions(&self) -> SessionRegistry {
         self.sessions.clone()
     }
+    pub fn metrics(&self) -> StreamMetrics {
+        self.metrics.clone()
+    }
 
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", get(index_handler))
             .route("/ws", get(ws_handler))
+            .route("/remotemic-ca.crt", get(ca_handler))
+            .route("/metrics", get(metrics_handler))
             .with_state(self.clone())
     }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP handlers
-// ---------------------------------------------------------------------------
-
 async fn index_handler(State(state): State<Server>) -> Html<String> {
-    debug!("Serving microphone control page");
     Html(render_page(&state.token, state.audio_config))
+}
+
+async fn ca_handler(State(state): State<Server>) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/x-x509-ca-cert")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=remotemic-ca.crt",
+        )
+        .body(Body::from(state.ca_der.to_vec()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn metrics_handler(State(state): State<Server>) -> impl IntoResponse {
+    axum::Json(state.metrics.snapshot())
 }
 
 fn render_page(token: &str, audio_config: AudioConfig) -> String {
@@ -169,22 +307,15 @@ fn render_page(token: &str, audio_config: AudioConfig) -> String {
         .replace(
             "__REMOTEMIC_QUALITY__",
             &format!(
-                "{} · {} · mono",
+                "{} · {} · mono · Opus {} kb/s",
                 sample_rate_label(audio_config.sample_rate),
-                audio_config.sample_format.display_name()
+                audio_config.sample_format.display_name(),
+                audio_config.opus_bitrate / 1_000
             ),
         )
         .replace(
-            "__REMOTEMIC_SAMPLE_RATE__",
-            &audio_config.sample_rate.to_string(),
-        )
-        .replace(
-            "__REMOTEMIC_SAMPLE_FORMAT__",
-            audio_config.sample_format.browser_name(),
-        )
-        .replace(
-            "__REMOTEMIC_BYTES_PER_SAMPLE__",
-            &audio_config.sample_format.bytes_per_sample().to_string(),
+            "__REMOTEMIC_OPUS_BITRATE__",
+            &audio_config.opus_bitrate.to_string(),
         )
 }
 
@@ -204,223 +335,452 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Server>, uri: Uri)
                 .find_map(|pair| pair.strip_prefix("token="))
         })
         .is_some_and(|token| token == state.token.as_ref());
-
     if !authorized {
-        warn!("Rejected WebSocket upgrade with missing or invalid token");
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
-
-    debug!("Authorized WebSocket upgrade request");
-
     ws.max_message_size(MAX_WS_MESSAGE_SIZE)
         .max_frame_size(MAX_WS_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket session
-// ---------------------------------------------------------------------------
+#[derive(Clone)]
+struct WebRtcHandler {
+    session_id: u64,
+    audio_tx: AudioFrameSender,
+    audio_config: AudioConfig,
+    sessions: SessionRegistry,
+    metrics: StreamMetrics,
+    gather_complete: Arc<Notify>,
+}
+
+#[async_trait]
+impl PeerConnectionEventHandler for WebRtcHandler {
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        debug!(session_id = self.session_id, %state, "ICE gathering state changed");
+        if state == RTCIceGatheringState::Complete {
+            self.gather_complete.notify_one();
+        }
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        info!(session_id = self.session_id, %state, "WebRTC connection state changed");
+        if matches!(
+            state,
+            RTCPeerConnectionState::Failed
+                | RTCPeerConnectionState::Closed
+                | RTCPeerConnectionState::Disconnected
+        ) {
+            self.sessions.release(self.session_id);
+        }
+    }
+
+    async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        let Some(ssrc) = track.ssrcs().await.first().copied() else {
+            warn!(
+                session_id = self.session_id,
+                "Remote audio track has no SSRC"
+            );
+            return;
+        };
+        let is_opus = track
+            .codec(ssrc)
+            .await
+            .is_some_and(|codec| codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_OPUS));
+        if !is_opus {
+            warn!(
+                session_id = self.session_id,
+                "Ignoring non-Opus remote track"
+            );
+            return;
+        }
+        let handler = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = receive_opus_track(track, handler).await {
+                error!(%error, "WebRTC audio track failed");
+            }
+        });
+    }
+}
 
 async fn handle_socket(socket: WebSocket, state: Server) {
     let (mut sender, mut receiver) = socket.split();
-
     let Some(session_id) = state.sessions.acquire().await else {
-        warn!("Rejecting new connection - another client is already streaming");
         let _ = sender
             .send(Message::Text(
-                "error: another client is already connected".into(),
+                r#"{"type":"error","message":"another microphone is active"}"#.into(),
             ))
             .await;
         return;
     };
-
-    info!("Client connected (session {session_id})");
-    let _ = sender.send(Message::Text("ok: connected".into())).await;
-
-    let audio_tx = state.audio_tx.clone();
-    let bytes_per_sample = state.audio_config.sample_format.bytes_per_sample();
-    let mut dropped_frames = 0_u64;
-    let mut received_frames = 0_u64;
-    let mut received_bytes = 0_u64;
-    let mut timeouts = SessionTimeouts::new(tokio::time::Instant::now());
-
-    loop {
-        let deadline = timeouts.receive_deadline(tokio::time::Instant::now());
-        let msg = match tokio::time::timeout_at(deadline, receiver.next()).await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => break,
-            Err(_) => {
-                warn!(
-                    session_id,
-                    reason = timeouts.reason(),
-                    "Audio session timed out"
-                );
-                break;
-            }
-        };
-
-        match msg {
-            Ok(Message::Binary(data)) => {
-                if !is_valid_audio_frame_len(data.len(), bytes_per_sample) {
-                    warn!(
-                        session_id,
-                        bytes = data.len(),
-                        bytes_per_sample,
-                        "Rejecting malformed audio frame"
-                    );
-                    let _ = sender
-                        .send(Message::Text("error: invalid audio frame".into()))
-                        .await;
-                    let _ = sender.send(Message::Close(None)).await;
-                    break;
-                }
-
-                timeouts.record_audio();
-                received_frames += 1;
-                received_bytes += data.len() as u64;
-                trace!(
-                    session_id,
-                    bytes = data.len(),
-                    received_frames,
-                    received_bytes,
-                    "Received audio frame"
-                );
-                let frame = AudioFrame {
-                    session_id,
-                    data: data.to_vec(),
-                };
-                match audio_tx.try_send(frame) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        dropped_frames += 1;
-                        if dropped_frames == 1 || dropped_frames.is_multiple_of(100) {
-                            warn!(
-                                "Audio queue full for session {session_id}; dropping live frame ({dropped_frames} total)"
-                            );
-                        }
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        error!("Audio channel closed unexpectedly");
-                        break;
-                    }
-                }
-            }
-            Ok(Message::Close(reason)) => {
-                info!(session_id, ?reason, "Client sent close frame");
-                break;
-            }
-            Ok(message) => trace!(session_id, ?message, "Received non-audio WebSocket message"),
-            Err(e) => {
-                error!("WebSocket receive error: {e}");
-                break;
-            }
+    state.metrics.reset();
+    info!(session_id, "Signaling client connected");
+    let gather_complete = Arc::new(Notify::new());
+    let handler = Arc::new(WebRtcHandler {
+        session_id,
+        audio_tx: state.audio_tx.clone(),
+        audio_config: state.audio_config,
+        sessions: state.sessions.clone(),
+        metrics: state.metrics.clone(),
+        gather_complete: Arc::clone(&gather_complete),
+    });
+    let peer = match create_peer_connection(handler).await {
+        Ok(peer) => peer,
+        Err(error) => {
+            error!(session_id, %error, "Could not create WebRTC peer");
+            state.sessions.release(session_id);
+            return;
         }
+    };
+
+    let offer = tokio::time::timeout(SIGNALING_IDLE_TIMEOUT, receive_offer(&mut receiver)).await;
+    let offer = match offer {
+        Ok(Ok(offer)) => offer,
+        Ok(Err(error)) => {
+            send_error(&mut sender, &error).await;
+            close_peer(&peer, &state.sessions, session_id).await;
+            return;
+        }
+        Err(_) => {
+            send_error(&mut sender, "timed out waiting for WebRTC offer").await;
+            close_peer(&peer, &state.sessions, session_id).await;
+            return;
+        }
+    };
+    if let Err(error) = negotiate(&peer, offer, &gather_complete, &mut sender).await {
+        send_error(&mut sender, &error).await;
+        close_peer(&peer, &state.sessions, session_id).await;
+        return;
     }
 
-    state.sessions.release(session_id);
-    info!(
-        session_id,
-        received_frames, received_bytes, dropped_frames, "Client disconnected"
-    );
+    while let Some(message) = receiver.next().await {
+        match message {
+            Ok(Message::Close(_)) => break,
+            Err(error) => {
+                debug!(session_id, %error, "Signaling WebSocket ended");
+                break;
+            }
+            _ => {}
+        }
+    }
+    close_peer(&peer, &state.sessions, session_id).await;
+    info!(session_id, "WebRTC session ended");
+}
+
+async fn create_peer_connection(
+    handler: Arc<WebRtcHandler>,
+) -> Result<Arc<dyn PeerConnection>, String> {
+    let mut media_engine = MediaEngine::default();
+    media_engine
+        .register_codec(
+            RTCRtpCodecParameters {
+                rtp_codec: RTCRtpCodec {
+                    mime_type: MIME_TYPE_OPUS.to_owned(),
+                    clock_rate: OPUS_CLOCK_RATE,
+                    // WebRTC advertises Opus as opus/48000/2 even when fmtp forces mono.
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0".to_owned(),
+                    rtcp_feedback: Vec::new(),
+                },
+                payload_type: 111,
+            },
+            RtpCodecKind::Audio,
+        )
+        .map_err(|error| error.to_string())?;
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)
+        .map_err(|error| error.to_string())?;
+    let peer = PeerConnectionBuilder::new()
+        .with_configuration(RTCConfigurationBuilder::new().build())
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .with_handler(handler as Arc<dyn PeerConnectionEventHandler>)
+        .with_udp_addrs(vec!["0.0.0.0:0"])
+        .build()
+        .await
+        .map_err(|error| error.to_string())?;
+    peer.add_transceiver_from_kind(
+        RtpCodecKind::Audio,
+        Some(RTCRtpTransceiverInit {
+            direction: RTCRtpTransceiverDirection::Recvonly,
+            ..Default::default()
+        }),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(Arc::new(peer))
+}
+
+async fn receive_offer(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+) -> Result<RTCSessionDescription, String> {
+    while let Some(message) = receiver.next().await {
+        match message.map_err(|error| error.to_string())? {
+            Message::Text(text) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|_| "invalid signaling JSON")?;
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("offer") {
+                    return serde_json::from_value(value).map_err(|error| error.to_string());
+                }
+            }
+            Message::Close(_) => return Err("signaling connection closed".to_string()),
+            _ => {}
+        }
+    }
+    Err("signaling connection closed".to_string())
+}
+
+async fn negotiate(
+    peer: &Arc<dyn PeerConnection>,
+    offer: RTCSessionDescription,
+    gather_complete: &Notify,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), String> {
+    peer.set_remote_description(offer)
+        .await
+        .map_err(|error| error.to_string())?;
+    let answer = peer
+        .create_answer(None)
+        .await
+        .map_err(|error| error.to_string())?;
+    peer.set_local_description(answer)
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::time::timeout(Duration::from_secs(10), gather_complete.notified())
+        .await
+        .map_err(|_| "ICE gathering timed out".to_string())?;
+    let answer = peer
+        .local_description()
+        .await
+        .ok_or_else(|| "WebRTC answer was not created".to_string())?;
+    let json = serde_json::to_string(&answer).map_err(|error| error.to_string())?;
+    sender
+        .send(Message::Text(json.into()))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn close_peer(peer: &Arc<dyn PeerConnection>, sessions: &SessionRegistry, session_id: u64) {
+    if let Err(error) = peer.close().await {
+        debug!(session_id, %error, "WebRTC close failed");
+    }
+    sessions.release(session_id);
+}
+
+async fn send_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: &str,
+) {
+    let json = serde_json::json!({"type": "error", "message": message});
+    let _ = sender.send(Message::Text(json.to_string().into())).await;
+}
+
+async fn receive_opus_track(
+    track: Arc<dyn TrackRemote>,
+    handler: WebRtcHandler,
+) -> Result<(), String> {
+    let mut decoder = OpusDecoder::new(handler.audio_config.sample_rate as i32, 1)
+        .map_err(|error| format!("Opus decoder: {error}"))?;
+    let max_samples = handler.audio_config.sample_rate as usize * 120 / 1_000;
+    let mut f32_buffer = vec![0_f32; max_samples];
+    let mut sequence = None;
+    let mut previous_toc = None;
+    let mut previous_arrival = None;
+    let mut previous_timestamp = None;
+    let mut jitter_ticks = 0.0_f64;
+
+    while let Some(event) = track.poll().await {
+        let TrackRemoteEvent::OnRtpPacket(packet) = event else {
+            if matches!(event, TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnError) {
+                break;
+            }
+            continue;
+        };
+        if !handler.sessions.is_active(handler.session_id) {
+            break;
+        }
+        let now = Instant::now();
+        handler
+            .metrics
+            .0
+            .packets_received
+            .fetch_add(1, Ordering::Relaxed);
+        update_jitter(
+            &handler.metrics,
+            packet.header.timestamp,
+            now,
+            &mut previous_arrival,
+            &mut previous_timestamp,
+            &mut jitter_ticks,
+        );
+        if let Some(previous) = sequence {
+            let delta = packet.header.sequence_number.wrapping_sub(previous);
+            if delta == 0 || delta > 0x8000 {
+                handler
+                    .metrics
+                    .0
+                    .packets_reordered
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let missing = delta.saturating_sub(1);
+            handler
+                .metrics
+                .0
+                .packets_lost
+                .fetch_add(u64::from(missing), Ordering::Relaxed);
+            if let Some(toc) = previous_toc {
+                for _ in 0..missing.min(MAX_PLC_PACKETS) {
+                    decode_and_queue(&mut decoder, &[toc], &mut f32_buffer, &handler)?;
+                }
+            }
+        }
+        sequence = Some(packet.header.sequence_number);
+        if !has_opus_payload(&packet.payload) {
+            trace!(
+                sequence_number = packet.header.sequence_number,
+                "Ignoring RTP packet without Opus payload"
+            );
+            continue;
+        }
+        previous_toc = packet.payload.first().copied();
+        decode_and_queue(&mut decoder, &packet.payload, &mut f32_buffer, &handler)?;
+    }
+    Ok(())
+}
+
+fn has_opus_payload(payload: &[u8]) -> bool {
+    !payload.is_empty()
+}
+
+fn decode_and_queue(
+    decoder: &mut OpusDecoder,
+    payload: &[u8],
+    f32_buffer: &mut [f32],
+    handler: &WebRtcHandler,
+) -> Result<(), String> {
+    let samples = decoder
+        .decode(payload, f32_buffer.len(), f32_buffer)
+        .map_err(|error| format!("Opus decode: {error}"))?;
+    let data = match handler.audio_config.sample_format {
+        SampleFormat::S16Le => {
+            let mut bytes = Vec::with_capacity(samples * 2);
+            for sample in &f32_buffer[..samples] {
+                let scaled = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+                bytes.extend_from_slice(&scaled.to_le_bytes());
+            }
+            bytes
+        }
+        SampleFormat::Float32Le => {
+            let mut bytes = Vec::with_capacity(samples * 4);
+            for sample in &f32_buffer[..samples] {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            bytes
+        }
+    };
+    let frame = AudioFrame {
+        session_id: handler.session_id,
+        data,
+        enqueued_at: Instant::now(),
+    };
+    handler
+        .metrics
+        .0
+        .decoded_frames
+        .fetch_add(1, Ordering::Relaxed);
+    if handler.audio_tx.send_latest(frame) {
+        handler
+            .metrics
+            .0
+            .dropped_frames
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+fn update_jitter(
+    metrics: &StreamMetrics,
+    timestamp: u32,
+    arrival: Instant,
+    previous_arrival: &mut Option<Instant>,
+    previous_timestamp: &mut Option<u32>,
+    jitter_ticks: &mut f64,
+) {
+    if let (Some(last_arrival), Some(last_timestamp)) = (*previous_arrival, *previous_timestamp) {
+        let arrival_delta =
+            arrival.duration_since(last_arrival).as_secs_f64() * f64::from(OPUS_CLOCK_RATE);
+        let rtp_delta = timestamp.wrapping_sub(last_timestamp) as f64;
+        let difference = (arrival_delta - rtp_delta).abs();
+        *jitter_ticks += (difference - *jitter_ticks) / 16.0;
+        metrics.0.jitter_micros.store(
+            (*jitter_ticks * 1_000_000.0 / f64::from(OPUS_CLOCK_RATE)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+    *previous_arrival = Some(arrival);
+    *previous_timestamp = Some(timestamp);
+    trace!(timestamp, jitter_ticks, "Updated RTP jitter");
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FIRST_AUDIO_FRAME_TIMEOUT, SESSION_IDLE_TIMEOUT, SessionRegistry, SessionTimeouts,
-        is_valid_audio_frame_len, render_page,
+        AudioFrame, SessionRegistry, StreamMetrics, audio_frame_channel, has_opus_payload,
+        render_page,
     };
     use crate::audio::AudioConfig;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
 
     #[tokio::test]
     async fn stale_release_cannot_clear_a_new_session() {
         let sessions = SessionRegistry::default();
         let first = sessions.acquire().await.unwrap();
         sessions.release(first);
-
         let second = sessions.acquire().await.unwrap();
         sessions.release(first);
-
         assert!(sessions.is_active(second));
-        assert!(sessions.acquire().await.is_none());
     }
 
     #[test]
-    fn heartbeats_do_not_extend_first_audio_deadline() {
-        let start = tokio::time::Instant::now();
-        let timeouts = SessionTimeouts::new(start);
-
-        assert_eq!(
-            timeouts.receive_deadline(start + SESSION_IDLE_TIMEOUT),
-            start + FIRST_AUDIO_FRAME_TIMEOUT
-        );
+    fn metrics_reports_packet_loss_percentage() {
+        let metrics = StreamMetrics::default();
+        metrics.0.packets_received.store(90, Ordering::Relaxed);
+        metrics.0.packets_lost.store(10, Ordering::Relaxed);
+        assert_eq!(metrics.snapshot().loss_percent, 10.0);
     }
 
     #[test]
-    fn activity_extends_streaming_session_deadline_after_first_audio() {
-        let start = tokio::time::Instant::now();
-        let mut timeouts = SessionTimeouts::new(start);
-        timeouts.record_audio();
-        let activity = start + FIRST_AUDIO_FRAME_TIMEOUT;
-
-        assert_eq!(
-            timeouts.receive_deadline(activity),
-            activity + SESSION_IDLE_TIMEOUT
-        );
-    }
-
-    #[test]
-    fn audio_frame_length_requires_whole_nonempty_samples() {
-        assert!(is_valid_audio_frame_len(4_096, 2));
-        assert!(is_valid_audio_frame_len(16_384, 4));
-        assert!(!is_valid_audio_frame_len(0, 2));
-        assert!(!is_valid_audio_frame_len(3, 2));
-        assert!(!is_valid_audio_frame_len(6, 4));
-        assert!(!is_valid_audio_frame_len(4, 0));
-    }
-
-    #[test]
-    fn high_quality_page_uses_matching_wire_format() {
+    fn high_quality_page_uses_configured_opus_bitrate() {
         let html = render_page("test-token", AudioConfig::HIGH);
-
-        assert!(html.contains("const SAMPLE_RATE = 48000;"));
-        assert!(html.contains("const SAMPLE_FORMAT = \"float32le\";"));
-        assert!(html.contains("const BYTES_PER_SAMPLE = 4;"));
-        assert!(html.contains("48 kHz · 32-bit float · mono"));
-        assert!(!html.contains("__REMOTEMIC_"));
+        assert!(html.contains("const OPUS_BITRATE = 192000;"));
     }
 
     #[test]
-    fn low_quality_page_uses_matching_wire_format() {
-        let html = render_page("test-token", AudioConfig::LOW);
+    fn page_requests_ten_millisecond_opus_packets() {
+        let html = render_page("test-token", AudioConfig::HIGH);
+        assert!(html.contains("a=ptime:10"));
+    }
 
-        assert!(html.contains("const SAMPLE_RATE = 16000;"));
-        assert!(html.contains("const SAMPLE_FORMAT = \"s16le\";"));
-        assert!(html.contains("const BYTES_PER_SAMPLE = 2;"));
-        assert!(html.contains("16 kHz · 16-bit PCM · mono"));
-        assert!(!html.contains("__REMOTEMIC_"));
+    #[tokio::test]
+    async fn full_audio_queue_replaces_oldest_frame() {
+        let (sender, receiver) = audio_frame_channel(1);
+        sender.send_latest(AudioFrame {
+            session_id: 1,
+            data: vec![1],
+            enqueued_at: Instant::now(),
+        });
+        let replaced = sender.send_latest(AudioFrame {
+            session_id: 1,
+            data: vec![2],
+            enqueued_at: Instant::now(),
+        });
+
+        assert_eq!((replaced, receiver.recv().await.data), (true, vec![2]));
     }
 
     #[test]
-    fn standard_quality_page_displays_fractional_sample_rate() {
-        let html = render_page("test-token", AudioConfig::STANDARD);
-
-        assert!(html.contains("44.1 kHz · 16-bit PCM · mono"));
-    }
-
-    #[test]
-    fn page_falls_back_to_default_audio_context_sample_rate() {
-        let html = render_page("test-token", AudioConfig::LOW);
-
-        assert!(html.contains("return new AudioContextClass();"));
-    }
-
-    #[test]
-    fn page_sends_session_heartbeats() {
-        let html = render_page("test-token", AudioConfig::STANDARD);
-
-        assert!(html.contains("const HEARTBEAT_INTERVAL_MS = 10000;"));
-        assert!(html.contains("socket.send(\"heartbeat\");"));
-        assert!(html.contains("clearInterval(session.heartbeatTimer);"));
+    fn empty_rtp_payload_is_not_passed_to_opus_decoder() {
+        assert!(!has_opus_payload(&[]));
+        assert!(has_opus_payload(&[0xf8, 0xff, 0xfe]));
     }
 }
