@@ -748,19 +748,76 @@ pub const HTML: &str = r#"
         if (input.length === 0) return input;
         if (inputRate === SAMPLE_RATE) return input;
 
+        const samples = state.filter
+          ? lowPass(input, state.filter)
+          : input;
         const step = inputRate / SAMPLE_RATE;
         const output = [];
         let position = state.position;
-        while (position < input.length - 1) {
+        while (position < samples.length - 1) {
           const index = Math.floor(position);
           const fraction = position - index;
-          const left = index < 0 ? state.previous : input[index];
-          const right = input[index + 1];
+          const left = index < 0 ? state.previous : samples[index];
+          const right = samples[index + 1];
           output.push(left + (right - left) * fraction);
           position += step;
         }
-        state.position = position - input.length;
-        state.previous = input[input.length - 1];
+        state.position = position - samples.length;
+        state.previous = samples[samples.length - 1];
+        return output;
+      }
+
+      function createResampler(inputRate) {
+        const state = { position: 0, previous: 0, filter: null };
+        if (inputRate <= SAMPLE_RATE) return state;
+
+        const tapCount = 95;
+        const cutoff = (SAMPLE_RATE * 0.425) / inputRate;
+        const midpoint = (tapCount - 1) / 2;
+        const coefficients = new Float32Array(tapCount);
+        let total = 0;
+        for (let i = 0; i < tapCount; i++) {
+          const offset = i - midpoint;
+          const sinc =
+            offset === 0
+              ? 2 * cutoff
+              : Math.sin(2 * Math.PI * cutoff * offset) / (Math.PI * offset);
+          const window =
+            0.42 -
+            0.5 * Math.cos((2 * Math.PI * i) / (tapCount - 1)) +
+            0.08 * Math.cos((4 * Math.PI * i) / (tapCount - 1));
+          coefficients[i] = sinc * window;
+          total += coefficients[i];
+        }
+        for (let i = 0; i < tapCount; i++) coefficients[i] /= total;
+
+        state.filter = {
+          coefficients,
+          history: new Float32Array(tapCount),
+          position: 0,
+        };
+        return state;
+      }
+
+      function lowPass(input, filter) {
+        const output = new Float32Array(input.length);
+        const { coefficients, history } = filter;
+        let position = filter.position;
+
+        for (let i = 0; i < input.length; i++) {
+          history[position] = input[i];
+          let sample = 0;
+          let historyIndex = position;
+          for (let tap = 0; tap < coefficients.length; tap++) {
+            sample += coefficients[tap] * history[historyIndex];
+            historyIndex =
+              historyIndex === 0 ? history.length - 1 : historyIndex - 1;
+          }
+          output[i] = sample;
+          position = position + 1 === history.length ? 0 : position + 1;
+        }
+
+        filter.position = position;
         return output;
       }
 
@@ -885,6 +942,18 @@ pub const HTML: &str = r#"
         });
       }
 
+      function createAudioContext(AudioContextClass) {
+        try {
+          return new AudioContextClass({ sampleRate: SAMPLE_RATE });
+        } catch (err) {
+          console.warn(
+            `Could not create ${SAMPLE_RATE} Hz audio context; using browser default:`,
+            err,
+          );
+          return new AudioContextClass();
+        }
+      }
+
       function cleanup(session, closeSocket = false) {
         if (closeSocket) previousSocketClosed = waitForSocketClose(session);
         if (session.cleaned) return previousSocketClosed;
@@ -923,11 +992,20 @@ pub const HTML: &str = r#"
           return;
         }
 
+        let audioCtx;
+        try {
+          audioCtx = createAudioContext(AudioContextClass);
+        } catch (err) {
+          console.error("Could not create audio context:", err);
+          setStatus("Web Audio unavailable", "error");
+          return;
+        }
+
         const session = {
           id: ++nextSessionId,
           socket: null,
           stream: null,
-          audioCtx: new AudioContextClass({ sampleRate: SAMPLE_RATE }),
+          audioCtx,
           source: null,
           processor: null,
           analyser: null,
@@ -936,7 +1014,7 @@ pub const HTML: &str = r#"
           wakeLock: null,
           wakeLockRequest: null,
           closeResolvers: [],
-          resampler: { position: 0, previous: 0 },
+          resampler: createResampler(audioCtx.sampleRate),
           muted: false,
           cleaned: false,
           accepted: false,
@@ -1044,7 +1122,8 @@ pub const HTML: &str = r#"
         const session = currentSession;
         if (!session || !session.accepted) return;
         session.muted = !session.muted;
-        if (!session.muted) session.resampler = { position: 0, previous: 0 };
+        if (!session.muted)
+          session.resampler = createResampler(session.audioCtx.sampleRate);
         applyMuteVisuals(session);
       });
 

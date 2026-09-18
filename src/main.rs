@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_config.sample_rate,
         audio_config.sample_format.pulse_name()
     );
-    let virtual_mic = VirtualMic::new(audio_config, options.source_name.clone());
+    let virtual_mic = VirtualMic::new(audio_config, options.source_name.clone())?;
     virtual_mic.load().await?;
 
     let pipe_path = virtual_mic.pipe_path();
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let server = Server::new(audio_tx, audio_config);
 
-    print_access_urls(port);
+    print_access_urls(listen_addr.ip(), port);
 
     let writer = tokio::spawn(audio_writer_loop(pipe_path, audio_rx, server.sessions()));
     let app = server.router();
@@ -290,12 +290,33 @@ Options:
   -V, --version              Print version"#
 }
 
-fn print_access_urls(port: u16) {
-    info!("Open http://localhost:{port}");
+fn print_access_urls(address: IpAddr, port: u16) {
+    let connect_address = connect_address(address);
+    let url_host = url_host(connect_address);
+
+    info!("Open http://{url_host}:{port}");
     info!(
         "NOTE: Microphone access requires HTTPS on non-localhost origins. \
-             If the mic does not work, run: npx localtunnel --port {port}"
+             If the mic does not work, run: npx localtunnel --port {port} \
+             --local-host {connect_address}"
     );
+}
+
+fn connect_address(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(address) if address.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(address) if address.is_unspecified() => {
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+        address => address,
+    }
+}
+
+fn url_host(address: IpAddr) -> String {
+    match address {
+        IpAddr::V4(address) => address.to_string(),
+        IpAddr::V6(address) => format!("[{address}]"),
+    }
 }
 
 async fn shutdown_signal() {
@@ -440,8 +461,8 @@ fn drain_channel(rx: &mut mpsc::Receiver<AudioFrame>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_QUEUE_SIZE, Options, Quality, parse_args};
-    use std::net::{IpAddr, Ipv4Addr};
+    use super::{DEFAULT_QUEUE_SIZE, Options, Quality, connect_address, parse_args, url_host};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use tracing_subscriber::filter::LevelFilter;
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -529,5 +550,33 @@ mod tests {
     #[test]
     fn rejects_source_name_with_spaces() {
         assert!(parse_args(strings(&["--source-name", "Studio Mic"])).is_err());
+    }
+
+    #[test]
+    fn unspecified_ipv4_advertises_ipv4_loopback() {
+        assert_eq!(
+            connect_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn unspecified_ipv6_advertises_ipv6_loopback() {
+        assert_eq!(
+            connect_address(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn concrete_bind_address_is_advertised_unchanged() {
+        let address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+
+        assert_eq!(connect_address(address), address);
+    }
+
+    #[test]
+    fn ipv6_url_host_is_bracketed() {
+        assert_eq!(url_host(IpAddr::V6(Ipv6Addr::LOCALHOST)), "[::1]");
     }
 }

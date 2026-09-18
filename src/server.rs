@@ -301,4 +301,11 @@ mod tests {
 
         assert!(html.contains("44.1 kHz · 16-bit PCM · mono"));
     }
+
+    #[test]
+    fn page_falls_back_to_default_audio_context_sample_rate() {
+        let html = render_page("test-token", AudioConfig::LOW);
+
+        assert!(html.contains("return new AudioContextClass();"));
+    }
 }

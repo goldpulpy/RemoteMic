@@ -1,5 +1,5 @@
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -83,13 +83,13 @@ enum VirtualMicState {
 }
 
 impl VirtualMic {
-    pub fn new(config: AudioConfig, source_name: impl Into<Arc<str>>) -> Self {
-        Self {
+    pub fn new(config: AudioConfig, source_name: impl Into<Arc<str>>) -> Result<Self, String> {
+        Ok(Self {
             state: Arc::new(Mutex::new(VirtualMicState::Unloaded)),
-            pipe_path: default_pipe_path(),
+            pipe_path: default_pipe_path()?,
             config,
             source_name: source_name.into(),
-        }
+        })
     }
 
     pub fn pipe_path(&self) -> PathBuf {
@@ -228,29 +228,108 @@ impl VirtualMic {
     }
 }
 
-fn default_pipe_path() -> PathBuf {
-    let dir = pipe_dir();
+fn default_pipe_path() -> Result<PathBuf, String> {
+    let uid = std::fs::metadata("/proc/self")
+        .map_err(|e| format!("Could not determine the current user: {e}"))?
+        .uid();
+    let dir = pipe_dir(uid);
 
-    if let Err(e) = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-    {
-        warn!("Could not create pipe directory {}: {e}", dir.display());
-    }
+    ensure_private_directory(&dir, uid)
+        .map_err(|e| format!("Unsafe pipe directory {}: {e}", dir.display()))?;
 
-    dir.join(PIPE_FILE_NAME)
+    Ok(dir.join(PIPE_FILE_NAME))
 }
 
-fn pipe_dir() -> PathBuf {
+fn ensure_private_directory(dir: &Path, uid: u32) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is not a directory",
+        ));
+    }
+    if metadata.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("owned by uid {}, expected uid {uid}", metadata.uid()),
+        ));
+    }
+
+    let permissions = metadata.mode() & 0o777;
+    if permissions != 0o700 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("permissions are {permissions:#o}, expected 0o700"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn pipe_dir(uid: u32) -> PathBuf {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
         && !runtime.is_empty()
     {
         return PathBuf::from(runtime).join("remotemic");
     }
 
-    let uid = std::fs::metadata("/proc/self")
-        .map(|meta| meta.uid())
-        .unwrap_or(0);
     std::env::temp_dir().join(format!("remotemic-{uid}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_private_directory;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn unique_test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "remotemic-test-{name}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    #[test]
+    fn ensure_private_directory_rejects_permissive_existing_directory() {
+        let path = unique_test_path("permissive");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+
+        let result = ensure_private_directory(&path, uid);
+        std::fs::remove_dir(&path).unwrap();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ensure_private_directory_accepts_private_existing_directory() {
+        let path = unique_test_path("private");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+
+        let result = ensure_private_directory(&path, uid);
+        std::fs::remove_dir(&path).unwrap();
+
+        assert!(result.is_ok(), "unexpected error: {result:?}");
+    }
+
+    #[test]
+    fn ensure_private_directory_rejects_unexpected_owner() {
+        let path = unique_test_path("owner");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+
+        let result = ensure_private_directory(&path, uid.wrapping_add(1));
+        std::fs::remove_dir(&path).unwrap();
+
+        assert!(result.is_err());
+    }
 }
