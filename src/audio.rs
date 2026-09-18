@@ -34,6 +34,13 @@ impl SampleFormat {
             Self::Float32Le => 4,
         }
     }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::S16Le => "16-bit PCM",
+            Self::Float32Le => "32-bit float",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

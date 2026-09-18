@@ -115,6 +115,14 @@ fn render_page(token: &str, audio_config: AudioConfig) -> String {
     page::HTML
         .replace("__REMOTEMIC_TOKEN__", token)
         .replace(
+            "__REMOTEMIC_QUALITY__",
+            &format!(
+                "{} · {} · mono",
+                sample_rate_label(audio_config.sample_rate),
+                audio_config.sample_format.display_name()
+            ),
+        )
+        .replace(
             "__REMOTEMIC_SAMPLE_RATE__",
             &audio_config.sample_rate.to_string(),
         )
@@ -126,6 +134,13 @@ fn render_page(token: &str, audio_config: AudioConfig) -> String {
             "__REMOTEMIC_BYTES_PER_SAMPLE__",
             &audio_config.sample_format.bytes_per_sample().to_string(),
         )
+}
+
+fn sample_rate_label(sample_rate: u32) -> String {
+    match sample_rate % 1_000 {
+        0 => format!("{} kHz", sample_rate / 1_000),
+        _ => format!("{:.1} kHz", sample_rate as f64 / 1_000.0),
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Server>, uri: Uri) -> Response {
@@ -237,6 +252,7 @@ mod tests {
         assert!(html.contains("const SAMPLE_RATE = 48000;"));
         assert!(html.contains("const SAMPLE_FORMAT = \"float32le\";"));
         assert!(html.contains("const BYTES_PER_SAMPLE = 4;"));
+        assert!(html.contains("48 kHz · 32-bit float · mono"));
         assert!(!html.contains("__REMOTEMIC_"));
     }
 
@@ -247,6 +263,14 @@ mod tests {
         assert!(html.contains("const SAMPLE_RATE = 16000;"));
         assert!(html.contains("const SAMPLE_FORMAT = \"s16le\";"));
         assert!(html.contains("const BYTES_PER_SAMPLE = 2;"));
+        assert!(html.contains("16 kHz · 16-bit PCM · mono"));
         assert!(!html.contains("__REMOTEMIC_"));
+    }
+
+    #[test]
+    fn standard_quality_page_displays_fractional_sample_rate() {
+        let html = render_page("test-token", AudioConfig::STANDARD);
+
+        assert!(html.contains("44.1 kHz · 16-bit PCM · mono"));
     }
 }

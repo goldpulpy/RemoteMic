@@ -494,6 +494,10 @@ pub const HTML: &str = r#"
             <span class="fact-label">Screen</span>
             <span class="fact-value" id="wake-state">Managed when connected</span>
           </div>
+          <div class="fact">
+            <span class="fact-label">Quality</span>
+            <span class="fact-value">__REMOTEMIC_QUALITY__</span>
+          </div>
         </div>
       </div>
 
