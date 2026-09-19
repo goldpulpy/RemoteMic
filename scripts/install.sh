@@ -11,6 +11,7 @@ ASSUME_YES="false"
 SKIP_DEPENDENCIES="false"
 DEPENDENCIES_ONLY="false"
 AUTOSTART="false"
+MODIFY_PATH="true"
 
 usage() {
     cat <<'EOF'
@@ -27,6 +28,7 @@ Arguments:
   --skip-dependencies  Do not check or install system dependencies
   --dependencies-only  Check/install dependencies without downloading RemoteMic
   --autostart          Enable startup with systemd, OpenRC, or runit
+  --no-modify-path     Do not add $HOME/.local/bin to the shell configuration
   -h, --help           Show this help
 
 The INSTALL_DIR environment variable can also set the destination directory.
@@ -70,6 +72,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --autostart)
             AUTOSTART="true"
+            shift
+            ;;
+        --no-modify-path)
+            MODIFY_PATH="false"
             shift
             ;;
         -h|--help)
@@ -542,11 +548,66 @@ enable_autostart() {
     return 1
 }
 
+configure_path() {
+    case ":${PATH}:" in
+        *:"${INSTALL_DIR}":*) return 0 ;;
+    esac
+
+    if [ "${MODIFY_PATH}" = "false" ] || [ "${INSTALL_DIR}" != "${HOME}/.local/bin" ]; then
+        echo "Add ${INSTALL_DIR} to PATH to run 'remotemic' from any directory."
+        return 0
+    fi
+
+    shell_name="${SHELL:-}"
+    shell_name="${shell_name##*/}"
+    case "${shell_name}" in
+        bash)
+            config_file="${HOME}/.bashrc"
+            path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+            ;;
+        zsh)
+            config_file="${HOME}/.zshrc"
+            path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+            ;;
+        fish)
+            config_file="${XDG_CONFIG_HOME:-${HOME}/.config}/fish/config.fish"
+            path_line="fish_add_path \"\$HOME/.local/bin\""
+            ;;
+        sh|dash|ash|ksh)
+            config_file="${HOME}/.profile"
+            path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+            ;;
+        *)
+            echo "Could not detect a supported login shell."
+            echo "Add ${INSTALL_DIR} to PATH to run 'remotemic' from any directory."
+            return 0
+            ;;
+    esac
+
+    config_dir="${config_file%/*}"
+    if ! mkdir -p "${config_dir}"; then
+        echo "WARNING: Could not create ${config_dir}; PATH was not updated." >&2
+        return 0
+    fi
+
+    if [ -f "${config_file}" ] && grep -Fqx "${path_line}" "${config_file}"; then
+        echo "${INSTALL_DIR} is already configured in ${config_file}."
+        echo "Restart the terminal, then run 'remotemic'."
+        return 0
+    fi
+
+    if ! printf '\n%s\n' "${path_line}" >>"${config_file}"; then
+        echo "WARNING: Could not update ${config_file}; PATH was not updated." >&2
+        echo "Add ${INSTALL_DIR} to PATH to run 'remotemic' from any directory."
+        return 0
+    fi
+
+    echo "Added ${INSTALL_DIR} to PATH in ${config_file}."
+    echo "Restart the terminal, then run 'remotemic'."
+}
+
+configure_path
+
 if [ "${AUTOSTART}" = "true" ]; then
     enable_autostart
 fi
-
-case ":${PATH}:" in
-    *:"${INSTALL_DIR}":*) ;;
-    *) echo "Add ${INSTALL_DIR} to PATH to run 'remotemic' from any directory." ;;
-esac

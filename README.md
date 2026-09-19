@@ -107,6 +107,11 @@ installing the appropriate package through APT
 Zypper (openSUSE/SUSE), or APK (Alpine). Pass `--yes` for unattended dependency
 installation or `--skip-dependencies` to install only the RemoteMic binary.
 
+When installing to the default `~/.local/bin` directory, the installer adds it
+to the detected Bash, Zsh, Fish, or POSIX shell configuration when necessary.
+Restart the terminal after the first installation. Pass `--no-modify-path` to
+leave the shell configuration unchanged.
+
 Prebuilt releases currently target x86_64 Linux. On another architecture, build
 RemoteMic from source with the native Rust target.
 
