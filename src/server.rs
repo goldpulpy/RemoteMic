@@ -756,6 +756,8 @@ async fn receive_opus_track(
             break;
         }
         let now = Instant::now();
+        let mut decoded_audio = Vec::new();
+        let mut decoded_frames = 0;
         if let Some(previous) = sequence {
             let Some(delta) = forward_sequence_delta(previous, packet.header.sequence_number)
             else {
@@ -777,10 +779,15 @@ async fn receive_opus_track(
                 // frame; other codes reject a one-byte packet before PLC runs.
                 let conceal_toc = concealment_toc(toc);
                 for _ in 0..missing.min(MAX_PLC_PACKETS) {
-                    if let Err(error) =
-                        decode_and_queue(&mut decoder, &[conceal_toc], &mut f32_buffer, handler)
-                    {
-                        debug!(%error, "Opus packet-loss concealment failed");
+                    match decode_into_pcm(
+                        &mut decoder,
+                        &[conceal_toc],
+                        &mut f32_buffer,
+                        handler.audio_config.sample_format,
+                        &mut decoded_audio,
+                    ) {
+                        Ok(()) => decoded_frames += 1,
+                        Err(error) => debug!(%error, "Opus packet-loss concealment failed"),
                     }
                 }
             }
@@ -804,11 +811,17 @@ async fn receive_opus_track(
                 sequence_number = packet.header.sequence_number,
                 "Ignoring RTP packet without Opus payload"
             );
+            enqueue_decoded_audio(handler, decoded_audio, decoded_frames);
             continue;
         }
-        if let Err(error) =
-            decode_and_queue(&mut decoder, &packet.payload, &mut f32_buffer, handler)
-        {
+        if let Err(error) = decode_into_pcm(
+            &mut decoder,
+            &packet.payload,
+            &mut f32_buffer,
+            handler.audio_config.sample_format,
+            &mut decoded_audio,
+        ) {
+            enqueue_decoded_audio(handler, decoded_audio, decoded_frames);
             warn!(
                 session_id = handler.session_id,
                 sequence_number = packet.header.sequence_number,
@@ -817,6 +830,8 @@ async fn receive_opus_track(
             );
             continue;
         }
+        decoded_frames += 1;
+        enqueue_decoded_audio(handler, decoded_audio, decoded_frames);
         previous_toc = packet.payload.first().copied();
     }
     Ok(())
@@ -831,32 +846,38 @@ fn concealment_toc(toc: u8) -> u8 {
     toc & 0xFC
 }
 
-fn decode_and_queue(
+fn decode_into_pcm(
     decoder: &mut OpusDecoder,
     payload: &[u8],
     f32_buffer: &mut [f32],
-    handler: &WebRtcHandler,
+    sample_format: SampleFormat,
+    decoded_audio: &mut Vec<u8>,
 ) -> Result<(), String> {
     let samples = decoder
         .decode(payload, f32_buffer.len(), f32_buffer)
         .map_err(|error| format!("Opus decode: {error}"))?;
-    let data = match handler.audio_config.sample_format {
+    match sample_format {
         SampleFormat::S16Le => {
-            let mut bytes = Vec::with_capacity(samples * 2);
+            decoded_audio.reserve(samples * 2);
             for sample in &f32_buffer[..samples] {
                 let scaled = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-                bytes.extend_from_slice(&scaled.to_le_bytes());
+                decoded_audio.extend_from_slice(&scaled.to_le_bytes());
             }
-            bytes
         }
         SampleFormat::Float32Le => {
-            let mut bytes = Vec::with_capacity(samples * 4);
+            decoded_audio.reserve(samples * 4);
             for sample in &f32_buffer[..samples] {
-                bytes.extend_from_slice(&sample.to_le_bytes());
+                decoded_audio.extend_from_slice(&sample.to_le_bytes());
             }
-            bytes
         }
-    };
+    }
+    Ok(())
+}
+
+fn enqueue_decoded_audio(handler: &WebRtcHandler, data: Vec<u8>, decoded_frames: u64) {
+    if decoded_frames == 0 {
+        return;
+    }
     let frame = AudioFrame {
         session_id: handler.session_id,
         data,
@@ -866,7 +887,7 @@ fn decode_and_queue(
         .metrics
         .0
         .decoded_frames
-        .fetch_add(1, Ordering::Relaxed);
+        .fetch_add(decoded_frames, Ordering::Relaxed);
     if handler.audio_tx.send_latest(frame) {
         handler
             .metrics
@@ -874,7 +895,6 @@ fn decode_and_queue(
             .dropped_frames
             .fetch_add(1, Ordering::Relaxed);
     }
-    Ok(())
 }
 
 fn update_jitter(
@@ -921,7 +941,8 @@ mod tests {
     use super::{
         AudioFrame, MetricsHub, RTCPeerConnectionState, SessionRegistry, StreamMetrics,
         WebRtcHandler, audio_frame_channel, concealment_toc, constant_time_eq,
-        forward_sequence_delta, has_opus_payload, ice_udp_addrs, render_page, wait_for_connected,
+        enqueue_decoded_audio, forward_sequence_delta, has_opus_payload, ice_udp_addrs,
+        render_page, wait_for_connected,
     };
     use crate::audio::AudioConfig;
     use std::sync::Arc;
@@ -1102,6 +1123,38 @@ mod tests {
         });
 
         assert_eq!((replaced, receiver.recv().await.data), (true, vec![2]));
+    }
+
+    #[tokio::test]
+    async fn loss_concealment_and_current_audio_survive_one_slot_backpressure() {
+        let sessions = SessionRegistry::default();
+        let session_id = sessions.acquire().await.unwrap();
+        let metrics = StreamMetrics::default();
+        let metrics_hub = MetricsHub::default();
+        metrics_hub.install(&metrics);
+        let (connection_state, _) = tokio::sync::watch::channel(RTCPeerConnectionState::Connected);
+        let (audio_tx, audio_rx) = audio_frame_channel(1);
+        let handler = WebRtcHandler {
+            session_id,
+            audio_tx,
+            audio_config: AudioConfig::STANDARD,
+            sessions,
+            metrics: metrics.clone(),
+            metrics_hub,
+            gather_complete: Arc::new(tokio::sync::Notify::new()),
+            connection_state,
+        };
+        handler.audio_tx.send_latest(AudioFrame {
+            session_id,
+            data: vec![0],
+            enqueued_at: Instant::now(),
+        });
+
+        enqueue_decoded_audio(&handler, vec![1, 2, 3, 4], 2);
+
+        assert_eq!(audio_rx.recv().await.data, vec![1, 2, 3, 4]);
+        assert_eq!(metrics.0.decoded_frames.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.0.dropped_frames.load(Ordering::Relaxed), 1);
     }
 
     #[test]
