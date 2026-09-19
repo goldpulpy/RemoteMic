@@ -1739,6 +1739,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]

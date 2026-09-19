@@ -73,7 +73,7 @@ pub struct InstanceLock {
 
 impl InstanceLock {
     pub fn acquire() -> Result<Self, String> {
-        let uid = current_uid()?;
+        let uid = current_uid();
         let dir = pipe_dir(uid);
         ensure_private_directory(&dir, uid)
             .map_err(|e| format!("Unsafe runtime directory {}: {e}", dir.display()))?;
@@ -151,7 +151,7 @@ impl VirtualMic {
             return Ok(());
         }
 
-        let removed = unload_stale_modules(&self.source_name).await;
+        let removed = unload_stale_modules(&self.source_name, &self.pipe_path).await;
         if removed > 0 {
             info!(removed, "Removed stale module-pipe-source modules");
         }
@@ -199,7 +199,7 @@ impl VirtualMic {
         let module_index: u32 = match stdout.trim().parse() {
             Ok(module_index) => module_index,
             Err(error) => {
-                let removed = unload_stale_modules(&self.source_name).await;
+                let removed = unload_stale_modules(&self.source_name, &self.pipe_path).await;
                 return Err(format!(
                     "Unexpected pactl output {:?}: {error}; rolled back {removed} matching module(s)",
                     stdout.trim()
@@ -264,7 +264,7 @@ impl VirtualMic {
     }
 }
 
-async fn unload_stale_modules(source_name: &str) -> usize {
+async fn unload_stale_modules(source_name: &str, pipe_path: &Path) -> usize {
     let mut list_command = Command::new("pactl");
     list_command.args(["list", "short", "modules"]);
     let output = match run_pactl(list_command, "list modules").await {
@@ -283,7 +283,7 @@ async fn unload_stale_modules(source_name: &str) -> usize {
     };
     let mut unloaded = 0;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if !is_pipe_source_for(line, source_name) {
+        if !is_pipe_source_for(line, source_name, pipe_path) {
             continue;
         }
         let Some(index) = line.split_whitespace().next() else {
@@ -318,15 +318,18 @@ async fn run_pactl(mut command: Command, action: &str) -> Result<std::process::O
         .map_err(|error| format!("Failed to execute pactl {action}: {error}"))
 }
 
-fn is_pipe_source_for(line: &str, source_name: &str) -> bool {
-    let marker = format!("source_name={source_name}");
+fn is_pipe_source_for(line: &str, source_name: &str, pipe_path: &Path) -> bool {
+    let source_marker = format!("source_name={source_name}");
+    let file_marker = format!("file={}", pipe_path.display());
     let mut fields = line.split_whitespace();
     let _index = fields.next();
-    fields.next() == Some("module-pipe-source") && fields.any(|field| field == marker)
+    fields.next() == Some("module-pipe-source")
+        && fields.any(|field| field == source_marker)
+        && line.split_whitespace().any(|field| field == file_marker)
 }
 
 fn default_pipe_path() -> Result<PathBuf, String> {
-    let uid = current_uid()?;
+    let uid = current_uid();
     let dir = pipe_dir(uid);
 
     ensure_private_directory(&dir, uid)
@@ -335,10 +338,8 @@ fn default_pipe_path() -> Result<PathBuf, String> {
     Ok(dir.join(PIPE_FILE_NAME))
 }
 
-fn current_uid() -> Result<u32, String> {
-    std::fs::metadata("/proc/self")
-        .map_err(|e| format!("Could not determine the current user: {e}"))
-        .map(|metadata| metadata.uid())
+fn current_uid() -> u32 {
+    nix::unistd::Uid::effective().as_raw()
 }
 
 fn ensure_private_directory(dir: &Path, uid: u32) -> std::io::Result<()> {
@@ -384,8 +385,8 @@ fn pipe_dir(uid: u32) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceLock, ensure_private_directory, is_pipe_source_for};
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use super::{InstanceLock, current_uid, ensure_private_directory, is_pipe_source_for};
+    use std::os::unix::fs::PermissionsExt;
 
     fn unique_test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -400,7 +401,7 @@ mod tests {
         let path = unique_test_path("permissive");
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+        let uid = current_uid();
 
         let result = ensure_private_directory(&path, uid);
         std::fs::remove_dir(&path).unwrap();
@@ -413,7 +414,7 @@ mod tests {
         let path = unique_test_path("private");
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+        let uid = current_uid();
 
         let result = ensure_private_directory(&path, uid);
         std::fs::remove_dir(&path).unwrap();
@@ -426,7 +427,7 @@ mod tests {
         let path = unique_test_path("owner");
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+        let uid = current_uid();
 
         let result = ensure_private_directory(&path, uid.wrapping_add(1));
         std::fs::remove_dir(&path).unwrap();
@@ -458,10 +459,22 @@ mod tests {
 
     #[test]
     fn stale_module_match_requires_exact_source_name() {
+        let pipe = std::path::Path::new("/tmp/mic");
         let exact = "17\tmodule-pipe-source\tsource_name=RemoteMic file=/tmp/mic\t0";
-        let prefixed = "18\tmodule-pipe-source\tsource_name=RemoteMicBackup file=/tmp/backup\t0";
+        let prefixed = "18\tmodule-pipe-source\tsource_name=RemoteMicBackup file=/tmp/mic\t0";
 
-        assert!(is_pipe_source_for(exact, "RemoteMic"));
-        assert!(!is_pipe_source_for(prefixed, "RemoteMic"));
+        assert!(is_pipe_source_for(exact, "RemoteMic", pipe));
+        assert!(!is_pipe_source_for(prefixed, "RemoteMic", pipe));
+    }
+
+    #[test]
+    fn stale_module_match_requires_exact_pipe_path() {
+        let other = "18\tmodule-pipe-source\tsource_name=RemoteMic file=/tmp/other\t0";
+
+        assert!(!is_pipe_source_for(
+            other,
+            "RemoteMic",
+            std::path::Path::new("/tmp/mic")
+        ));
     }
 }

@@ -5,6 +5,21 @@ set -eu
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "${TEST_ROOT}"' EXIT HUP INT TERM
 
+if grep -Eq 'libasound|NEED_ALSA' scripts/install.sh; then
+    echo "Installer still requires an unrelated ALSA runtime" >&2
+    exit 1
+fi
+
+set +e
+RELATIVE_OUTPUT="$(
+    sh scripts/install.sh --skip-dependencies --autostart --install-dir relative/bin 2>&1
+)"
+RELATIVE_STATUS="$?"
+set -e
+test "${RELATIVE_STATUS}" -ne 0
+printf '%s\n' "${RELATIVE_OUTPUT}" \
+    | grep -Fq -- "--install-dir must be an absolute path when using --autostart"
+
 set +e
 OUTPUT="$(
     # Variables in this block are intentionally expanded by the isolated child shell.

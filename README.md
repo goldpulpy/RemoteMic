@@ -69,7 +69,6 @@ on the same network.
 - PulseAudio, or PipeWire with `pipewire-pulse`
 - `pactl`, normally provided by `pulseaudio-utils` or the distribution's
   PulseAudio client package
-- `libpulse.so.0` and `libasound.so.2`
 
 ### 📱 Sending device
 
@@ -89,8 +88,8 @@ No public tunnel or internet connection is required for a same-network setup.
 <details open>
 <summary><strong>Install a prebuilt binary</strong></summary>
 
-Install the latest release into `~/.local/bin` (the download is verified with
-SHA-256):
+Install the latest x86_64 release into `~/.local/bin` (the download is verified
+with SHA-256):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh
@@ -102,11 +101,14 @@ Install a specific version:
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh -s -- --version 1.2.3
 ```
 
-The installer checks `pactl`, `libpulse.so.0`, and `libasound.so.2`. If any are
-missing, it asks before installing the appropriate packages through APT
+The installer checks `pactl`. If it is missing, the installer asks before
+installing the appropriate package through APT
 (Debian/Ubuntu), DNF or YUM (Fedora/RHEL derivatives), Pacman (Arch derivatives),
 Zypper (openSUSE/SUSE), or APK (Alpine). Pass `--yes` for unattended dependency
 installation or `--skip-dependencies` to install only the RemoteMic binary.
+
+Prebuilt releases currently target x86_64 Linux. On another architecture, build
+RemoteMic from source with the native Rust target.
 
 Use `--install-dir /usr/local/bin` to choose another destination (you may need
 to run the downloaded script with elevated permissions for system directories).
@@ -442,6 +444,9 @@ setups. If none can be configured, it prints a warning and keeps the successful
 RemoteMic binary installation, but returns a non-zero status so scripts can
 detect that autostart was not enabled.
 
+When using `--autostart`, `--install-dir` must be an absolute path so the service
+does not depend on the directory from which it happens to start.
+
 For manual systemd setup, create
 `~/.config/systemd/user/remotemic.service` with the following contents:
 
@@ -607,22 +612,6 @@ sudo pacman -S libpulse
 </details>
 
 <details>
-<summary><strong>Required audio libraries are missing</strong></summary>
-
-```bash
-# Ubuntu / Debian
-sudo apt install libpulse0 libasound2
-
-# Fedora
-sudo dnf install pulseaudio-libs alsa-lib
-
-# Arch Linux
-sudo pacman -S libpulse alsa-lib
-```
-
-</details>
-
-<details>
 <summary><strong>The browser warns about the certificate or blocks microphone access</strong></summary>
 
 Install `remotemic-ca.crt` as a trusted root CA on the sending device (see
@@ -630,8 +619,8 @@ Install `remotemic-ca.crt` as a trusted root CA on the sending device (see
 and reopen the browser. The certificate covers `localhost` and the LAN IP
 detected at startup; if you reach the server through a different address (for
 example a VPN IP or hostname), the certificate will not match. Restart RemoteMic
-while bound to that address, or add the address to the device's hosts and use
-`localhost`.
+while bound to that exact address. `localhost` only refers to the device running
+the browser, so it cannot be used from a phone to reach the computer.
 
 </details>
 
@@ -816,7 +805,7 @@ src/audio.rs      audio presets and PulseAudio virtual-source lifecycle
 src/server.rs     HTTPS/WebSocket signaling, WebRTC, Opus decode, session state
 src/tls.rs        persistent local CA and per-run HTTPS certificate
 src/page.rs       embedded browser UI, WebRTC client, and metrics
-src/preflight.rs  pactl and shared-library checks
+src/preflight.rs  pactl availability check
 ```
 
 Useful commands:

@@ -69,7 +69,6 @@ RemoteMic предоставляет собственный HTTPS-интерфе
 - PulseAudio или PipeWire с `pipewire-pulse`
 - `pactl`, обычно предоставляемый пакетом `pulseaudio-utils` или клиентским пакетом
   PulseAudio вашего дистрибутива
-- `libpulse.so.0` и `libasound.so.2`
 
 ### 📱 Отправляющее устройство
 
@@ -89,7 +88,8 @@ RemoteMic предоставляет собственный HTTPS-интерфе
 <details open>
 <summary><strong>Установить готовый бинарный файл</strong></summary>
 
-Установите последний релиз в `~/.local/bin` (загрузка проверяется по SHA-256):
+Установите последний релиз для x86_64 в `~/.local/bin` (загрузка проверяется по
+SHA-256):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh
@@ -101,11 +101,14 @@ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulp
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulpy/RemoteMic/main/scripts/install.sh | sh -s -- --version 1.2.3
 ```
 
-Установщик проверяет наличие `pactl`, `libpulse.so.0` и `libasound.so.2`. Если
-чего-то не хватает, он запрашивает подтверждение и устанавливает нужные пакеты
+Установщик проверяет наличие `pactl`. Если его нет, установщик запрашивает
+подтверждение и устанавливает нужный пакет
 через APT (Debian/Ubuntu), DNF или YUM (Fedora и производные RHEL), Pacman
 (производные Arch), Zypper (openSUSE/SUSE) либо APK (Alpine). Для установки без
 вопросов передайте `--yes`, а `--skip-dependencies` установит только RemoteMic.
+
+Готовые релизы сейчас предназначены для Linux x86_64. На другой архитектуре
+соберите RemoteMic из исходников с нативным Rust target.
 
 Другой каталог можно выбрать через `--install-dir /usr/local/bin` (для записи
 в системный каталог скачанный скрипт может потребоваться запустить с повышенными
@@ -441,6 +444,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/goldpulp
 предупреждение, сохранит успешно установленный бинарный файл RemoteMic и вернёт
 ненулевой код, чтобы автоматизация могла определить, что автозапуск не включён.
 
+При использовании `--autostart` значение `--install-dir` должно быть абсолютным
+путём, чтобы запуск сервиса не зависел от текущего каталога.
+
 Для ручной настройки systemd создайте файл
 `~/.config/systemd/user/remotemic.service` со следующим содержимым:
 
@@ -609,22 +615,6 @@ sudo pacman -S libpulse
 </details>
 
 <details>
-<summary><strong>Отсутствуют необходимые аудиобиблиотеки</strong></summary>
-
-```bash
-# Ubuntu / Debian
-sudo apt install libpulse0 libasound2
-
-# Fedora
-sudo dnf install pulseaudio-libs alsa-lib
-
-# Arch Linux
-sudo pacman -S libpulse alsa-lib
-```
-
-</details>
-
-<details>
 <summary><strong>Браузер предупреждает о сертификате или блокирует доступ к микрофону</strong></summary>
 
 Установите `remotemic-ca.crt` как доверенный корневой CA на отправляющем устройстве
@@ -632,8 +622,8 @@ sudo pacman -S libpulse alsa-lib
 затем полностью закройте и снова откройте браузер. Сертификат охватывает `localhost`
 и LAN IP, определённый при запуске; если вы обращаетесь к серверу по другому адресу
 (например, VPN IP или hostname), сертификат не совпадёт. Перезапустите RemoteMic,
-привязав его к этому адресу, либо добавьте адрес в hosts устройства и используйте
-`localhost`.
+привязав его точно к этому адресу. `localhost` всегда обозначает устройство, на
+котором открыт браузер, поэтому с телефона обратиться так к компьютеру нельзя.
 
 </details>
 
@@ -817,7 +807,7 @@ src/audio.rs      audio presets and PulseAudio virtual-source lifecycle
 src/server.rs     HTTPS/WebSocket signaling, WebRTC, Opus decode, session state
 src/tls.rs        persistent local CA and per-run HTTPS certificate
 src/page.rs       embedded browser UI, WebRTC client, and metrics
-src/preflight.rs  pactl and shared-library checks
+src/preflight.rs  проверка доступности pactl
 ```
 
 Полезные команды:

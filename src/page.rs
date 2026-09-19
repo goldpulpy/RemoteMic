@@ -667,12 +667,25 @@ pub const HTML: &str = r#"
 
       function waitForSocket(socket) {
         return new Promise((resolve, reject) => {
-          socket.addEventListener("open", resolve, { once: true });
-          socket.addEventListener(
-            "error",
-            () => reject(new Error("Signaling connection failed")),
-            { once: true },
+          const timeout = setTimeout(
+            () => finish(new Error("Signaling connection timed out")),
+            15000,
           );
+          const opened = () => finish();
+          const failed = () => finish(new Error("Signaling connection failed"));
+          const closed = () =>
+            finish(new Error("Signaling connection closed before opening"));
+          function finish(error) {
+            clearTimeout(timeout);
+            socket.removeEventListener("open", opened);
+            socket.removeEventListener("error", failed);
+            socket.removeEventListener("close", closed);
+            if (error) reject(error);
+            else resolve();
+          }
+          socket.addEventListener("open", opened, { once: true });
+          socket.addEventListener("error", failed, { once: true });
+          socket.addEventListener("close", closed, { once: true });
         });
       }
 
@@ -881,7 +894,7 @@ pub const HTML: &str = r#"
           const stream = await navigator.mediaDevices.getUserMedia({
             audio: {
               sampleRate: { ideal: 48000 },
-              channelCount: { exact: 1 },
+              channelCount: { ideal: 1 },
               echoCancellation: false,
               noiseSuppression: false,
               autoGainControl: false,
@@ -898,6 +911,15 @@ pub const HTML: &str = r#"
           const track = stream.getAudioTracks()[0];
           if (!track) throw new Error("Microphone stream has no audio track");
           activeSession.track = track;
+          track.addEventListener(
+            "ended",
+            () => {
+              if (isCurrentSession(activeSession)) {
+                stop("Microphone access ended", true);
+              }
+            },
+            { once: true },
+          );
           if ("contentHint" in track) track.contentHint = "music";
 
           const AudioContextClass =

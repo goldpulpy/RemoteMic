@@ -63,7 +63,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    preflight::check_audio_libs().await;
     debug!("Startup checks completed");
 
     let audio_config = options.quality.audio_config();

@@ -16,9 +16,11 @@ format. The tag and the package version in `Cargo.toml` must match.
    ```
 
 The release workflow verifies formatting, Clippy, tests, the installer, and the
-tag/package version match. It then builds the static Linux x86_64 binary,
-publishes it with a SHA-256 checksum, marks the release as latest, and generates
-release notes from the merged pull requests since the previous release.
+tag/package version match. A read-only job then builds the static Linux x86_64
+binary and transfers it as a workflow artifact to the narrowly scoped publishing
+job. That final job publishes the binary with a SHA-256 checksum, marks the
+release as latest, and generates release notes from the merged pull requests
+since the previous release.
 
 If any verification fails, no GitHub Release is created. Keep published tags
 immutable: fix the problem and publish a new patch version instead of moving or

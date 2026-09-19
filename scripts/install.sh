@@ -117,36 +117,13 @@ case "$(uname -s):$(uname -m)" in
         ;;
 esac
 
-has_library() {
-    library="$1"
-
-    if command -v ldconfig >/dev/null 2>&1 \
-        && ldconfig -p 2>/dev/null | grep -Fq "${library}"; then
-        return 0
-    fi
-
-    find /lib /usr/lib -name "${library}" -print -quit 2>/dev/null | grep -q .
-}
-
 check_dependencies() {
-    NEED_PACTL="false"
-    NEED_PULSE="false"
-    NEED_ALSA="false"
-
-    command -v pactl >/dev/null 2>&1 || NEED_PACTL="true"
-    has_library libpulse.so.0 || NEED_PULSE="true"
-    has_library libasound.so.2 || NEED_ALSA="true"
-
-    [ "${NEED_PACTL}" = "false" ] \
-        && [ "${NEED_PULSE}" = "false" ] \
-        && [ "${NEED_ALSA}" = "false" ]
+    command -v pactl >/dev/null 2>&1
 }
 
 show_missing_dependencies() {
     echo "Missing system dependencies:"
-    [ "${NEED_PACTL}" = "false" ] || echo "  - pactl"
-    [ "${NEED_PULSE}" = "false" ] || echo "  - libpulse.so.0"
-    [ "${NEED_ALSA}" = "false" ] || echo "  - libasound.so.2"
+    echo "  - pactl"
 }
 
 detect_package_manager() {
@@ -188,60 +165,28 @@ confirm_dependency_install() {
 }
 
 install_with_apt() {
-    set --
-    [ "${NEED_PACTL}" = "false" ] || set -- "$@" pulseaudio-utils
-    [ "${NEED_PULSE}" = "false" ] || set -- "$@" libpulse0
-    if [ "${NEED_ALSA}" = "true" ]; then
-        if apt-cache show libasound2t64 >/dev/null 2>&1; then
-            set -- "$@" libasound2t64
-        else
-            set -- "$@" libasound2
-        fi
-    fi
-
     run_as_root apt-get update
-    run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+    run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y pulseaudio-utils
 }
 
 install_with_dnf() {
-    set --
-    [ "${NEED_PACTL}" = "false" ] || set -- "$@" pulseaudio-utils
-    [ "${NEED_PULSE}" = "false" ] || set -- "$@" pulseaudio-libs
-    [ "${NEED_ALSA}" = "false" ] || set -- "$@" alsa-lib
-    run_as_root dnf install -y "$@"
+    run_as_root dnf install -y pulseaudio-utils
 }
 
 install_with_yum() {
-    set --
-    [ "${NEED_PACTL}" = "false" ] || set -- "$@" pulseaudio-utils
-    [ "${NEED_PULSE}" = "false" ] || set -- "$@" pulseaudio-libs
-    [ "${NEED_ALSA}" = "false" ] || set -- "$@" alsa-lib
-    run_as_root yum install -y "$@"
+    run_as_root yum install -y pulseaudio-utils
 }
 
 install_with_pacman() {
-    set --
-    if [ "${NEED_PACTL}" = "true" ] || [ "${NEED_PULSE}" = "true" ]; then
-        set -- "$@" libpulse
-    fi
-    [ "${NEED_ALSA}" = "false" ] || set -- "$@" alsa-lib
-    run_as_root pacman -S --needed --noconfirm "$@"
+    run_as_root pacman -S --needed --noconfirm libpulse
 }
 
 install_with_zypper() {
-    set --
-    [ "${NEED_PACTL}" = "false" ] || set -- "$@" pulseaudio-utils
-    [ "${NEED_PULSE}" = "false" ] || set -- "$@" libpulse0
-    [ "${NEED_ALSA}" = "false" ] || set -- "$@" libasound2
-    run_as_root zypper --non-interactive install --no-recommends "$@"
+    run_as_root zypper --non-interactive install --no-recommends pulseaudio-utils
 }
 
 install_with_apk() {
-    set --
-    [ "${NEED_PACTL}" = "false" ] || set -- "$@" pulseaudio-utils
-    [ "${NEED_PULSE}" = "false" ] || set -- "$@" libpulse
-    [ "${NEED_ALSA}" = "false" ] || set -- "$@" alsa-lib
-    run_as_root apk add "$@"
+    run_as_root apk add pulseaudio-utils
 }
 
 ensure_dependencies() {
@@ -290,6 +235,16 @@ fi
 if [ "${DEPENDENCIES_ONLY}" = "true" ] && [ "${AUTOSTART}" = "true" ]; then
     echo "--dependencies-only and --autostart cannot be used together" >&2
     exit 2
+fi
+
+if [ "${AUTOSTART}" = "true" ]; then
+    case "${INSTALL_DIR}" in
+        /*) ;;
+        *)
+            echo "--install-dir must be an absolute path when using --autostart" >&2
+            exit 2
+            ;;
+    esac
 fi
 
 if [ "${AUTOSTART}" = "true" ] && [ "$(id -u)" -eq 0 ]; then

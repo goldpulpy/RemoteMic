@@ -1,7 +1,7 @@
 use axum_server::tls_rustls::RustlsConfig;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose,
+    KeyUsagePurpose, PublicKeyData,
 };
 use std::ffi::OsStr;
 use std::net::IpAddr;
@@ -41,6 +41,7 @@ pub async fn prepare(directory: &Path, server_ips: &[IpAddr]) -> Result<LocalTls
 
     let ca_key = KeyPair::from_pem(&ca_key_pem)
         .map_err(|error| format!("Could not parse local CA key: {error}"))?;
+    validate_ca_key_matches_certificate(&ca_pem, &ca_key)?;
     let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key)
         .map_err(|error| format!("Could not parse local CA certificate: {error}"))?;
 
@@ -94,9 +95,7 @@ fn ensure_private_directory(directory: &Path) -> Result<(), String> {
         return Err(format!("{} is not a directory", directory.display()));
     }
 
-    let uid = std::fs::metadata("/proc/self")
-        .map_err(|error| format!("Could not determine the current user: {error}"))?
-        .uid();
+    let uid = nix::unistd::Uid::effective().as_raw();
     if metadata.uid() != uid {
         return Err(format!(
             "Unsafe certificate directory {}: owned by uid {}, expected uid {uid}",
@@ -144,6 +143,21 @@ fn read_optional(path: &Path) -> Result<Option<String>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("Could not read {}: {error}", path.display())),
     }
+}
+
+fn validate_ca_key_matches_certificate(ca_pem: &str, ca_key: &KeyPair) -> Result<(), String> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(ca_pem.as_bytes())
+        .map_err(|error| format!("Could not parse local CA certificate: {error}"))?;
+    let certificate = pem
+        .parse_x509()
+        .map_err(|error| format!("Could not parse local CA certificate: {error}"))?;
+    if certificate.public_key().raw != ca_key.subject_public_key_info() {
+        return Err(
+            "Local CA certificate does not match its private key; restore the matching pair or remove both files and reinstall the CA on every device"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn create_ca(cert_path: &Path, key_path: &Path) -> Result<(String, String), String> {
@@ -251,7 +265,11 @@ fn pem_certificate_to_der(pem: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CA_TRANSACTION_FILE, certificate_directory_from, load_or_create_ca, prepare};
+    use super::{
+        CA_TRANSACTION_FILE, certificate_directory_from, load_or_create_ca, prepare,
+        validate_ca_key_matches_certificate,
+    };
+    use rcgen::KeyPair;
     use std::ffi::OsStr;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -324,5 +342,38 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
 
         assert!(result.is_ok(), "unexpected recovery error: {result:?}");
+    }
+
+    #[test]
+    fn ca_certificate_must_match_private_key() {
+        let first_directory = std::env::temp_dir().join(format!(
+            "remotemic-tls-first-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let second_directory = std::env::temp_dir().join(format!(
+            "remotemic-tls-second-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&first_directory).unwrap();
+        std::fs::create_dir_all(&second_directory).unwrap();
+        let (first_cert, _) = load_or_create_ca(
+            &first_directory.join("remotemic-ca.crt"),
+            &first_directory.join("remotemic-ca.key"),
+        )
+        .unwrap();
+        let (_, second_key) = load_or_create_ca(
+            &second_directory.join("remotemic-ca.crt"),
+            &second_directory.join("remotemic-ca.key"),
+        )
+        .unwrap();
+        let second_key = KeyPair::from_pem(&second_key).unwrap();
+
+        let result = validate_ca_key_matches_certificate(&first_cert, &second_key);
+        std::fs::remove_dir_all(first_directory).unwrap();
+        std::fs::remove_dir_all(second_directory).unwrap();
+
+        assert!(result.is_err());
     }
 }

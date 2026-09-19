@@ -424,6 +424,13 @@ impl WebRtcHandler {
         self.sessions.release(self.session_id);
         self.metrics_hub.clear(&self.metrics);
     }
+
+    fn fail_track(&self, message: &str) {
+        warn!(session_id = self.session_id, "{message}");
+        self.connection_state
+            .send_replace(RTCPeerConnectionState::Failed);
+        self.release();
+    }
 }
 
 #[async_trait]
@@ -448,10 +455,7 @@ impl PeerConnectionEventHandler for WebRtcHandler {
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
         let Some(ssrc) = track.ssrcs().await.first().copied() else {
-            warn!(
-                session_id = self.session_id,
-                "Remote audio track has no SSRC"
-            );
+            self.fail_track("Remote audio track has no SSRC");
             return;
         };
         let mut is_opus = false;
@@ -469,16 +473,16 @@ impl PeerConnectionEventHandler for WebRtcHandler {
             }
         }
         if !is_opus {
-            warn!(
-                session_id = self.session_id,
-                "Ignoring non-Opus remote track"
-            );
+            self.fail_track("Remote audio track did not negotiate Opus");
             return;
         }
         let handler = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = receive_opus_track(track, handler).await {
+            if let Err(error) = receive_opus_track(track, &handler).await {
                 error!(%error, "WebRTC audio track failed");
+            }
+            if handler.sessions.is_active(handler.session_id) {
+                handler.fail_track("Remote audio track ended");
             }
         });
     }
@@ -729,7 +733,7 @@ async fn send_error(
 
 async fn receive_opus_track(
     track: Arc<dyn TrackRemote>,
-    handler: WebRtcHandler,
+    handler: &WebRtcHandler,
 ) -> Result<(), String> {
     let mut decoder = OpusDecoder::new(handler.audio_config.sample_rate as i32, 1)
         .map_err(|error| format!("Opus decoder: {error}"))?;
@@ -774,7 +778,7 @@ async fn receive_opus_track(
                 let conceal_toc = concealment_toc(toc);
                 for _ in 0..missing.min(MAX_PLC_PACKETS) {
                     if let Err(error) =
-                        decode_and_queue(&mut decoder, &[conceal_toc], &mut f32_buffer, &handler)
+                        decode_and_queue(&mut decoder, &[conceal_toc], &mut f32_buffer, handler)
                     {
                         debug!(%error, "Opus packet-loss concealment failed");
                     }
@@ -803,7 +807,7 @@ async fn receive_opus_track(
             continue;
         }
         if let Err(error) =
-            decode_and_queue(&mut decoder, &packet.payload, &mut f32_buffer, &handler)
+            decode_and_queue(&mut decoder, &packet.payload, &mut f32_buffer, handler)
         {
             warn!(
                 session_id = handler.session_id,
@@ -916,10 +920,11 @@ fn ice_udp_addrs(bind: IpAddr) -> Vec<String> {
 mod tests {
     use super::{
         AudioFrame, MetricsHub, RTCPeerConnectionState, SessionRegistry, StreamMetrics,
-        audio_frame_channel, concealment_toc, constant_time_eq, forward_sequence_delta,
-        has_opus_payload, ice_udp_addrs, render_page, wait_for_connected,
+        WebRtcHandler, audio_frame_channel, concealment_toc, constant_time_eq,
+        forward_sequence_delta, has_opus_payload, ice_udp_addrs, render_page, wait_for_connected,
     };
     use crate::audio::AudioConfig;
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
@@ -967,6 +972,35 @@ mod tests {
         assert_eq!(
             wait_for_connected(&mut receiver).await,
             Err("WebRTC connection failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_audio_track_releases_session_and_notifies_connection_waiter() {
+        let sessions = SessionRegistry::default();
+        let session_id = sessions.acquire().await.unwrap();
+        let metrics = StreamMetrics::default();
+        let metrics_hub = MetricsHub::default();
+        metrics_hub.install(&metrics);
+        let (connection_state, receiver) =
+            tokio::sync::watch::channel(RTCPeerConnectionState::Connected);
+        let (audio_tx, _audio_rx) = audio_frame_channel(1);
+        let handler = WebRtcHandler {
+            session_id,
+            audio_tx,
+            audio_config: AudioConfig::STANDARD,
+            sessions: sessions.clone(),
+            metrics,
+            metrics_hub,
+            gather_complete: Arc::new(tokio::sync::Notify::new()),
+            connection_state,
+        };
+
+        handler.fail_track("test track ended");
+
+        assert_eq!(
+            (sessions.is_active(session_id), *receiver.borrow()),
+            (false, RTCPeerConnectionState::Failed)
         );
     }
 
@@ -1029,6 +1063,28 @@ mod tests {
         assert!(html.contains("!isCurrentSession(activeSession) ||"));
         assert!(html.contains("await lock.release().catch(() => {});"));
         assert!(html.contains("if (!isCurrentSession(activeSession)) return;"));
+    }
+
+    #[test]
+    fn page_requests_mono_without_requiring_device_support() {
+        let html = render_page("test-token", AudioConfig::STANDARD);
+
+        assert!(html.contains("channelCount: { ideal: 1 }"));
+    }
+
+    #[test]
+    fn page_stops_session_when_microphone_track_ends() {
+        let html = render_page("test-token", AudioConfig::STANDARD);
+
+        assert!(html.contains("stop(\"Microphone access ended\", true)"));
+    }
+
+    #[test]
+    fn page_times_out_or_rejects_socket_closed_before_opening() {
+        let html = render_page("test-token", AudioConfig::STANDARD);
+
+        assert!(html.contains("Signaling connection timed out"));
+        assert!(html.contains("Signaling connection closed before opening"));
     }
 
     #[tokio::test]
