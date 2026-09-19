@@ -563,19 +563,19 @@ configure_path() {
     case "${shell_name}" in
         bash)
             config_file="${HOME}/.bashrc"
-            path_line='export PATH="$HOME/.local/bin:$PATH"'
+            path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
             ;;
         zsh)
             config_file="${HOME}/.zshrc"
-            path_line='export PATH="$HOME/.local/bin:$PATH"'
+            path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
             ;;
         fish)
             config_file="${XDG_CONFIG_HOME:-${HOME}/.config}/fish/config.fish"
-            path_line='fish_add_path "$HOME/.local/bin"'
+            path_line="fish_add_path \"\$HOME/.local/bin\""
             ;;
         sh|dash|ash|ksh)
             config_file="${HOME}/.profile"
-            path_line='export PATH="$HOME/.local/bin:$PATH"'
+            path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
             ;;
         *)
             echo "Could not detect a supported login shell."

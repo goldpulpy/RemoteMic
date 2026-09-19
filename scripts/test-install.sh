@@ -65,7 +65,7 @@ set -e
 test "${STATUS}" -ne 0
 test -x "${TEST_ROOT}/home/.local/bin/remotemic"
 test -f "${TEST_ROOT}/config/systemd/user/remotemic.service"
-grep -Fqx 'export PATH="$HOME/.local/bin:$PATH"' "${TEST_ROOT}/home/.zshrc"
+grep -Fqx "export PATH=\"\$HOME/.local/bin:\$PATH\"" "${TEST_ROOT}/home/.zshrc"
 printf '%s\n' "${OUTPUT}" | grep -Fq "WARNING: The systemd user session is unavailable."
 printf '%s\n' "${OUTPUT}" | grep -Fq "Installed RemoteMic"
 printf '%s\n' "${OUTPUT}" | grep -Fq "Added ${TEST_ROOT}/home/.local/bin to PATH"
