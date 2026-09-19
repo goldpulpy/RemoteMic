@@ -759,12 +759,17 @@ certificate-authority entries, then fully restart the browser.
 
 ### 🧹 Uninstall RemoteMic from Linux
 
-Stop RemoteMic with `Ctrl+C`, then remove the prebuilt binary installed by the
-commands in this README:
+Stop RemoteMic with `Ctrl+C`, then remove the prebuilt binary from the
+installer's default destination:
 
 ```bash
-sudo rm /usr/local/bin/remotemic
+rm -- "$HOME/.local/bin/remotemic"
 ```
+
+If you installed RemoteMic with `--install-dir`, remove `remotemic` from that
+directory instead. For example, an installation made with
+`--install-dir /usr/local/bin` can be removed with
+`sudo rm -- /usr/local/bin/remotemic`.
 
 Remove the persistent local CA, its private key, and the RemoteMic data
 directory:
@@ -773,8 +778,8 @@ directory:
 rm -r -- "$HOME/.local/share/remotemic"
 ```
 
-If RemoteMic was built from source instead of installed into `/usr/local/bin`,
-remove the cloned repository or whichever binary you copied manually.
+If RemoteMic was built from source, remove the cloned repository or whichever
+binary you copied manually.
 
 > [!IMPORTANT]
 > Removing `~/.local/share/remotemic` permanently deletes the local CA private
