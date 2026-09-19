@@ -24,7 +24,10 @@ set +e
 OUTPUT="$(
     # Variables in this block are intentionally expanded by the isolated child shell.
     # shellcheck disable=SC2016
-    XDG_CONFIG_HOME="${TEST_ROOT}/config" TEST_INSTALL_ROOT="${TEST_ROOT}" sh -c '
+    HOME="${TEST_ROOT}/home" \
+        SHELL="/bin/zsh" \
+        XDG_CONFIG_HOME="${TEST_ROOT}/config" \
+        sh -c '
         curl() {
             output=""
             while [ "$#" -gt 0 ]; do
@@ -52,7 +55,7 @@ OUTPUT="$(
             return 1
         }
 
-        set -- --skip-dependencies --autostart --install-dir "${TEST_INSTALL_ROOT}/bin"
+        set -- --skip-dependencies --autostart
         . scripts/install.sh
     ' 2>&1
 )"
@@ -60,9 +63,11 @@ STATUS="$?"
 set -e
 
 test "${STATUS}" -ne 0
-test -x "${TEST_ROOT}/bin/remotemic"
+test -x "${TEST_ROOT}/home/.local/bin/remotemic"
 test -f "${TEST_ROOT}/config/systemd/user/remotemic.service"
+grep -Fqx 'export PATH="$HOME/.local/bin:$PATH"' "${TEST_ROOT}/home/.zshrc"
 printf '%s\n' "${OUTPUT}" | grep -Fq "WARNING: The systemd user session is unavailable."
 printf '%s\n' "${OUTPUT}" | grep -Fq "Installed RemoteMic"
+printf '%s\n' "${OUTPUT}" | grep -Fq "Added ${TEST_ROOT}/home/.local/bin to PATH"
 
 echo "Installer fallback test passed"
