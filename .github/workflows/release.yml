@@ -1,49 +1,131 @@
-name: Release Build
+name: Release
 
 on:
   push:
-    branches: ["main"]
-    paths:
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
+    tags:
+      - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-release:
-    name: Build and Upload Release
+  verify:
+    name: Verify release
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
 
-      - name: Add musl target
-        run: rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y musl-tools make
+      - name: Check tag and package version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must use the vMAJOR.MINOR.PATCH format: ${tag}" >&2
+            exit 1
+          fi
+
+          package_version="$(
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "remotemic") | .version'
+          )"
+          if [[ "${tag}" != "v${package_version}" ]]; then
+            echo "Tag ${tag} does not match Cargo.toml version ${package_version}" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Check installer
+        run: |
+          shellcheck scripts/install.sh scripts/test-install.sh
+          sh scripts/install.sh --yes --dependencies-only
+          if sh scripts/install.sh --dependencies-only --autostart; then
+            echo "Conflicting installer options were accepted" >&2
+            exit 1
+          fi
+          sh scripts/test-install.sh
+
+  build-release:
+    name: Build Linux x86_64
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: x86_64-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y binutils musl-tools make
 
       - name: Build release binary
         run: make release
 
-      - name: Prepare artifact
+      - name: Prepare release assets
+        shell: bash
         run: |
+          set -euo pipefail
+          asset="remotemic-linux-x86_64"
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/remotemic dist/remotemic
-          chmod +x dist/remotemic
+          install -m 0755 target/x86_64-unknown-linux-musl/release/remotemic "dist/${asset}"
+          cd dist
+          sha256sum "${asset}" > "${asset}.sha256"
 
-      - name: Create or update "latest" release
-        uses: softprops/action-gh-release@v2
+      - name: Upload release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          tag_name: latest
-          name: "Linux x86_64"
-          prerelease: true
-          files: dist/remotemic
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Linux x86_64 release
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: RemoteMic ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/remotemic-linux-x86_64
+            dist/remotemic-linux-x86_64.sha256
