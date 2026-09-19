@@ -381,7 +381,9 @@ enable_openrc_autostart() {
     service_user="$(id -un)"
     service_group="$(id -gn)"
     service_uid="$(id -u)"
+    # shellcheck disable=SC2016
     escaped_binary_path="$(printf '%s' "${binary_path}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
+    # shellcheck disable=SC2016
     escaped_home="$(printf '%s' "${HOME}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
 
     if ! cat >"${generated_service}" <<EOF
@@ -460,7 +462,9 @@ enable_runit_autostart() {
     service_user="$(id -un)"
     service_group="$(id -gn)"
     service_uid="$(id -u)"
+    # shellcheck disable=SC2016
     escaped_binary_path="$(printf '%s' "${binary_path}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
+    # shellcheck disable=SC2016
     escaped_home="$(printf '%s' "${HOME}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
 
     if ! cat >"${generated_run}" <<EOF
